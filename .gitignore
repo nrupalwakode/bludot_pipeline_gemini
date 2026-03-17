@@ -1,0 +1,56 @@
+# Environment files
+.env
+*.env
+
+# Python cache (all folders)
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+# VS Code
+.vscode/
+
+# Virtual envs
+venv/
+.env/
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Cache
+.cache/
+.parcel-cache/
+.eslintcache
+
+# Testing
+coverage/
+
+# Misc
+*.log

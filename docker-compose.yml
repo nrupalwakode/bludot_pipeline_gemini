@@ -1,0 +1,32 @@
+services:
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend        # Dockerfile lives here, copies contents into /app/backend/
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the backend source into /app/backend/ so --reload picks up changes
+      - ./backend:/app/backend
+      # Persistent upload storage (city files land here)
+      - ./uploads:/app/uploads
+    environment:
+      - DATABASE_URL=sqlite:////app/bludot_pipeline.db
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── React Frontend ───────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend/src:/app/src
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
