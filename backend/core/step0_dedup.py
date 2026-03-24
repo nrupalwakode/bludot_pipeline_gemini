@@ -14,6 +14,7 @@ All column mapping comes from the DB — no city_details.py needed.
 """
 
 import datetime
+import logging
 import os
 import re
 from pathlib import Path
@@ -26,6 +27,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sqlalchemy.orm import Session
 
 from ..db.models import City, ColumnMapping
+
+logger = logging.getLogger(__name__)
 
 
 # ── Date formatting helper (from bludot_concat.py) ───────────────────────────
@@ -167,19 +170,39 @@ class BusinessDeduplicator:
     def _normalize_address(self, address: str) -> str:
         if not address or address == '-':
             return ''
-        address = address.lower()
+        address = address.upper().strip()
+
+        # Expand abbreviations to standard form
         abbrevs = {
-            r'\bstreet\b': 'st', r'\bavenue\b': 'ave', r'\bboulevard\b': 'blvd',
-            r'\bdrive\b': 'dr', r'\broad\b': 'rd', r'\blane\b': 'ln',
-            r'\bcourt\b': 'ct', r'\bplace\b': 'pl', r'\bcircle\b': 'cir',
-            r'\bsuite\b': 'ste', r'\bnorth\b': 'n', r'\bsouth\b': 's',
-            r'\beast\b': 'e', r'\bwest\b': 'w',
+            r'\bSTREET\b': 'ST', r'\bAVENUE\b': 'AVE', r'\bBOULEVARD\b': 'BLVD',
+            r'\bDRIVE\b': 'DR', r'\bROAD\b': 'RD', r'\bLANE\b': 'LN',
+            r'\bCOURT\b': 'CT', r'\bPLACE\b': 'PL', r'\bCIRCLE\b': 'CIR',
+            r'\bTERRACE\b': 'TER', r'\bPARKWAY\b': 'PKWY', r'\bHIGHWAY\b': 'HWY',
+            r'\bSQUARE\b': 'SQ', r'\bSUITE\b': 'STE',
+            r'\bNORTH\b': 'N', r'\bSOUTH\b': 'S', r'\bEAST\b': 'E', r'\bWEST\b': 'W',
+            r'\bNORTHEAST\b': 'NE', r'\bNORTHWEST\b': 'NW',
+            r'\bSOUTHEAST\b': 'SE', r'\bSOUTHWEST\b': 'SW',
         }
         for pattern, repl in abbrevs.items():
             address = re.sub(pattern, repl, address)
-        address = re.sub(r'[^\w\s]', ' ', address)
+
+        # Strip unit/suite/apt suffixes BEFORE punctuation cleanup
+        # Handles: # 1/2, #B, STE A, APT 2B, UNIT 1, FL 3, PMB 277, etc.
+        address = re.sub(
+            r'(\s+#\s*\S+.*|\s+#$|\s+(?:STE|SUITE|APT|APARTMENT|UNIT|FL|FLOOR|'
+            r'BLDG|BUILDING|RM|ROOM|LOT|TRLR|TRAILER|PMB|BOX|DEPT|MSC)\b.*)$',
+            '', address, flags=re.IGNORECASE
+        ).strip()
+
+        # Strip trailing bare number/range unit designators e.g. '1-27'
+        address = re.sub(r'\s+\d+(?:-\d+)?$', '', address).strip()
+
+        # Remove remaining punctuation (keep hyphens inside tokens)
+        address = re.sub(r'[^\w\s-]', ' ', address)
+        # Collapse street number ranges to first number: 2710-3040 → 2710
+        address = re.sub(r'\b(\d+)-\d+\b', r'\1', address)
         address = re.sub(r'\s+', ' ', address)
-        return address.strip()
+        return address.strip().lower()
 
     def _is_po_box(self, address: str) -> bool:
         return bool(re.search(r'p\.?\s*o\.?\s*box', address, re.IGNORECASE))
@@ -193,7 +216,9 @@ class BusinessDeduplicator:
         return m.group(1) if m else ''
 
     def _extract_street_name(self, address: str) -> str:
-        return re.sub(r'^\s*\d+\s*', '', address).strip()
+        """Extract base street name with all unit suffixes stripped."""
+        normed = self._normalize_address(address)
+        return re.sub(r'^\s*\d+\s*', '', normed).strip()
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
 
@@ -358,69 +383,175 @@ def _bulk_insert(db: Session, objects: list) -> None:
 
 # ── 4-step dedup post-processing ─────────────────────────────────────────────
 
-def _step2_llm_verify_clusters(df: pd.DataFrame, city_id: int, db: Session) -> list[dict]:
+def _step2_verify_clusters_with_llm(df: pd.DataFrame, city_id: int, db: Session) -> int:
     """
-    Step 2 of dedup: LLM verifies LOW-CONFIDENCE intra-cluster pairs.
-    These are records in the SAME cluster whose similarity score was borderline.
+    Step 2: Verify intra-cluster pairs using rules + LLM for ambiguous cases.
 
-    We compute the pairwise similarity within each cluster. Pairs that scored
-    below LOW_CONFIDENCE_THRESHOLD (meaning LSH grouped them but they don't look
-    obviously the same) are sent to LLM.
+    For each multi-record cluster, check every pair:
 
-    Returns list of LLM results for UI display.
+    AUTO-MERGE (no LLM):
+      - Exact same name + exact same normalized address → definite duplicate
+
+    AUTO-SPLIT (no LLM):
+      - Same cluster but different street numbers → wrong grouping, split
+
+    LLM DECIDES:
+      - Same name + one/both addresses blank → LLM judges
+      - Same name + similar address (unit suffix difference) → LLM judges
+
+    IF LLM QUOTA EXHAUSTED → send to human review (cluster review UI)
+
+    Returns count of pairs processed.
     """
     from rapidfuzz import fuzz
-    from ..core.llm_judge import judge_dedup_pairs, DedupPair
-
-    LOW_CONFIDENCE = 0.72   # pairs in same cluster but below this → verify
+    from ..db.models import DedupReviewPair, CityRecord
+    from ..core.llm_judge import judge_dedup_pairs, DedupPair, has_api_key
 
     if 'cluster id' not in df.columns:
-        return []
+        return 0
 
-    pairs_to_verify: list[DedupPair] = []
     records = df[['city_index', 'cluster id', 'Business Name', 'Address1',
-                  'norm_name']].fillna('').to_dict('records')
+                  'norm_name', 'norm_address', 'street_num']].fillna('').to_dict('records')
 
     cluster_groups: dict = {}
     for row in records:
-        cid = row['cluster id']
-        cluster_groups.setdefault(cid, []).append(row)
+        cluster_groups.setdefault(row['cluster id'], []).append(row)
 
+    auto_merged  = 0
+    auto_split   = []   # (idx_b, new_cluster) pairs to split
+    llm_pairs    = []   # DedupPair objects to send to LLM
+    human_pairs  = []   # DedupReviewPair rows for direct human review
     seen: set[tuple] = set()
+    max_cluster = int(df['cluster id'].max()) if 'cluster id' in df.columns else 0
+
     for cid, group in cluster_groups.items():
         if len(group) < 2:
             continue
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
                 a, b = group[i], group[j]
-                sim = fuzz.token_sort_ratio(a['norm_name'], b['norm_name']) / 100.0
-                if sim < LOW_CONFIDENCE:
-                    key = (min(int(a['city_index']), int(b['city_index'])),
-                           max(int(a['city_index']), int(b['city_index'])))
-                    if key not in seen:
-                        seen.add(key)
-                        pairs_to_verify.append(DedupPair(
-                            pair_id   = f"{key[0]}_{key[1]}",
-                            index_a   = key[0], index_b   = key[1],
-                            name_a    = a['Business Name'], address_a = a['Address1'],
-                            name_b    = b['Business Name'], address_b = b['Address1'],
-                            similarity= sim,
-                        ))
+                key = (min(int(a['city_index']), int(b['city_index'])),
+                       max(int(a['city_index']), int(b['city_index'])))
+                if key in seen:
+                    continue
+                seen.add(key)
 
-    if not pairs_to_verify:
-        return []
+                addr_a = str(a['Address1']).strip()
+                addr_b = str(b['Address1']).strip()
+                addr_a_blank = addr_a in ('', '-', 'nan')
+                addr_b_blank = addr_b in ('', '-', 'nan')
+                sn_a = str(a['street_num']).strip()
+                sn_b = str(b['street_num']).strip()
+                norm_a = str(a['norm_address']).strip()
+                norm_b = str(b['norm_address']).strip()
+                name_sim = fuzz.token_sort_ratio(a['norm_name'], b['norm_name']) / 100.0
 
-    return judge_dedup_pairs(pairs_to_verify)
+                # ── AUTO-MERGE: exact same name + same normalized address ──────
+                if norm_a and norm_b and norm_a == norm_b and name_sim >= 0.95:
+                    auto_merged += 1
+                    continue  # already in same cluster, nothing to do
+
+                # ── AUTO-SPLIT: both street numbers present and different ───────
+                if sn_a and sn_b and sn_a != sn_b:
+                    max_cluster += 1
+                    auto_split.append((int(b['city_index']), max_cluster))
+                    continue
+
+                # ── LLM: one/both addresses blank OR similar address (unit diff) ─
+                addr_sim = fuzz.token_sort_ratio(norm_a, norm_b) if norm_a and norm_b else 0
+                needs_llm = (
+                    addr_a_blank or addr_b_blank  # blank address
+                    or (addr_sim >= 70 and name_sim >= 0.85)  # similar address (unit suffix diff)
+                )
+
+                if needs_llm:
+                    llm_pairs.append(DedupPair(
+                        pair_id       = f"{key[0]}_{key[1]}",
+                        index_a       = key[0],
+                        index_b       = key[1],
+                        name_a        = a['Business Name'],
+                        address_a     = addr_a,
+                        name_b        = b['Business Name'],
+                        address_b     = addr_b,
+                        similarity    = name_sim,
+                        intra_cluster = True,
+                    ))
+
+    # Apply auto-splits to DB
+    if auto_split:
+        for idx_b, new_cid in auto_split:
+            rec = db.query(CityRecord).filter_by(city_id=city_id, city_index=idx_b).first()
+            if rec:
+                rec.cluster_id = new_cid
+        db.commit()
+        logger.info(f"Step 0.2: Auto-split {len(auto_split)} wrong cluster assignments")
+
+    if not llm_pairs:
+        logger.info(f"Step 0.2: {auto_merged} auto-merged, {len(auto_split)} auto-split, 0 LLM pairs")
+        return auto_merged + len(auto_split)
+
+    # Send ambiguous pairs to LLM in one batched call
+    logger.info(f"Step 0.2: Sending {len(llm_pairs)} ambiguous intra-cluster pairs to LLM...")
+    results = judge_dedup_pairs(llm_pairs)
+
+    new_db_rows = []
+    for res in results:
+        p = next((x for x in llm_pairs if x.pair_id == res['pair_id']), None)
+        if not p:
+            continue
+
+        decision = res.get('decision', 'UNCERTAIN')
+
+        if decision == 'NOT_DUPLICATE':
+            # LLM says wrong cluster — split
+            max_cluster += 1
+            rec = db.query(CityRecord).filter_by(city_id=city_id, city_index=p.index_b).first()
+            if rec:
+                rec.cluster_id = max_cluster
+
+        elif decision == 'UNCERTAIN':
+            # LLM quota exhausted or unsure → human review
+            new_db_rows.append(DedupReviewPair(
+                city_id       = city_id,
+                index_a       = p.index_a,
+                index_b       = p.index_b,
+                name_a        = p.name_a,
+                address_a     = p.address_a,
+                name_b        = p.name_b,
+                address_b     = p.address_b,
+                similarity    = p.similarity,
+                llm_reason    = res.get('reason', 'LLM uncertain — needs human review'),
+                decision      = 'UNCERTAIN',
+                intra_cluster = True,
+            ))
+        # DUPLICATE → already in same cluster, nothing to do
+
+    if new_db_rows:
+        _bulk_insert(db, new_db_rows)
+
+    db.commit()
+    total = auto_merged + len(auto_split) + len(results)
+    logger.info(f"Step 0.2 done: {auto_merged} auto-merged, {len(auto_split)} auto-split, "
+                f"{len(results)} LLM judged, {len(new_db_rows)} sent to human review")
+    return total
 
 
 def _step3_cross_cluster_scan(df: pd.DataFrame,
-                               similarity_threshold: float = 0.85) -> list[dict]:
+                               similarity_threshold: float = 0.92) -> list[dict]:
     """
-    Step 3 of dedup: vectorised cross-cluster near-miss scan using rapidfuzz
-    process.cdist — replaces the O(n²) per-block loop.
+    Step 3 of dedup: find cross-cluster near-misses that are ACTUALLY
+    potential duplicates.
 
-    Returns list of {index_a, index_b, name_a, address_a, name_b, address_b, similarity}
-    for pairs in DIFFERENT clusters that score above threshold.
+    A pair is only flagged if:
+      1. Name similarity >= threshold (0.92 — near exact)
+      AND one of:
+      2a. At least one address is blank (can't compare, send to review)
+      2b. Address similarity >= 0.80 (addresses are also similar)
+
+    This prevents flagging KWOK FAN at 3213 OAK CT vs 3125 PERSIMMON ST
+    — same name, completely different addresses = different businesses.
+
+    Uses np.nonzero to avoid O(n²) Python loop.
     """
     from rapidfuzz import process, fuzz
     import numpy as np
@@ -429,101 +560,176 @@ def _step3_cross_cluster_scan(df: pd.DataFrame,
         return []
 
     records = df[['city_index', 'cluster id', 'Business Name',
-                  'Address1', 'norm_name']].fillna('').reset_index(drop=True)
+                  'Address1', 'norm_name', 'norm_address']].fillna('').reset_index(drop=True)
 
     names       = records['norm_name'].tolist()
+    addresses   = records['norm_address'].tolist()
     cluster_ids = records['cluster id'].tolist()
+    raw_addrs   = records['Address1'].tolist()
 
-    # rapidfuzz cdist computes all pairwise scores efficiently in C
-    # Use token_sort_ratio which handles word-order differences
-    scores = process.cdist(names, names, scorer=fuzz.token_sort_ratio,
-                           score_cutoff=int(similarity_threshold * 100))
+    # Vectorised name similarity — fast C implementation
+    name_scores = process.cdist(names, names, scorer=fuzz.token_sort_ratio,
+                                score_cutoff=int(similarity_threshold * 100))
+
+    # np.nonzero on upper triangle — no Python O(n²) loop
+    rows_idx, cols_idx = np.nonzero(np.triu(name_scores, k=1))
+    cluster_arr = np.array(cluster_ids)
 
     near_misses = []
-    n = len(names)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if scores[i, j] == 0:          # below cutoff → cdist returns 0
+    for i, j in zip(rows_idx.tolist(), cols_idx.tolist()):
+        # Skip same cluster — handled by step 2
+        if cluster_arr[i] == cluster_arr[j]:
+            continue
+
+        addr_a = str(raw_addrs[i]).strip()
+        addr_b = str(raw_addrs[j]).strip()
+        addr_a_blank = addr_a in ('', '-', 'nan')
+        addr_b_blank = addr_b in ('', '-', 'nan')
+
+        if addr_a_blank or addr_b_blank:
+            # One address missing — can't use address to reject, flag for review
+            pass
+        else:
+            # Both addresses present — check address similarity
+            addr_sim = fuzz.token_sort_ratio(addresses[i], addresses[j])
+            if addr_sim < 80:
+                # Addresses are clearly different → different locations → skip
                 continue
-            if cluster_ids[i] == cluster_ids[j]:  # same cluster → already handled
-                continue
-            sim = scores[i, j] / 100.0
-            near_misses.append({
-                'index_a'   : int(records.at[i, 'city_index']),
-                'index_b'   : int(records.at[j, 'city_index']),
-                'name_a'    : records.at[i, 'Business Name'],
-                'address_a' : records.at[i, 'Address1'],
-                'name_b'    : records.at[j, 'Business Name'],
-                'address_b' : records.at[j, 'Address1'],
-                'similarity': sim,
-            })
+
+        near_misses.append({
+            'index_a'   : int(records.at[i, 'city_index']),
+            'index_b'   : int(records.at[j, 'city_index']),
+            'name_a'    : records.at[i, 'Business Name'],
+            'address_a' : records.at[i, 'Address1'],
+            'name_b'    : records.at[j, 'Business Name'],
+            'address_b' : records.at[j, 'Address1'],
+            'similarity': float(name_scores[i, j]) / 100.0,
+        })
 
     return near_misses
 
 
-def _step4_llm_verify_near_misses(near_misses: list[dict],
-                                   city_id: int, db: Session) -> int:
+def _step4_verify_near_misses_with_llm(near_misses: list[dict],
+                                       city_id: int, db: Session) -> int:
     """
-    Step 4 of dedup: LLM verifies the cross-cluster near-miss candidates
-    found in step 3.
+    Step 4: Verify cross-cluster near-misses using rules + LLM.
 
-    Stores all results in DedupReviewPair table:
-      DUPLICATE     → auto-merge clusters, no human needed
-      NOT_DUPLICATE → stored but hidden from review UI
-      UNCERTAIN     → shown in review UI for human decision
+    Each near-miss already passed the step3 filter (name ≥ 92% AND
+    address blank or similar). Now decide:
 
-    Returns count of pairs stored.
+    AUTO-MERGE (no LLM):
+      - Exact same normalized address → same business, merge clusters
+
+    LLM DECIDES:
+      - One/both addresses blank → LLM judges by name only
+      - Similar address (unit suffix difference) → LLM judges
+
+    IF LLM QUOTA EXHAUSTED → send to human review (cluster review UI)
+
+    Returns count of pairs stored/processed.
     """
     from ..db.models import DedupReviewPair, CityRecord
     from ..core.llm_judge import judge_dedup_pairs, DedupPair
+    from rapidfuzz import fuzz
 
     if not near_misses:
         return 0
 
-    db.query(DedupReviewPair).filter_by(city_id=city_id).delete()
+    db.query(DedupReviewPair).filter_by(city_id=city_id, intra_cluster=False).delete()
     db.commit()
 
-    pairs = [
-        DedupPair(
-            pair_id   = f"{m['index_a']}_{m['index_b']}",
-            index_a   = m['index_a'],   index_b   = m['index_b'],
-            name_a    = m['name_a'],    address_a = m['address_a'],
-            name_b    = m['name_b'],    address_b = m['address_b'],
-            similarity= m['similarity'],
-        )
-        for m in near_misses
-    ]
+    # Build normalized address lookup from the df (use norm_address from near_miss dict)
+    auto_merged = []
+    llm_pairs   = []
 
-    results = judge_dedup_pairs(pairs)
+    for m in near_misses:
+        addr_a = str(m.get('address_a', '')).strip()
+        addr_b = str(m.get('address_b', '')).strip()
+        addr_a_blank = addr_a in ('', '-', 'nan')
+        addr_b_blank = addr_b in ('', '-', 'nan')
 
-    # Build lookup for metadata
-    meta = {f"{m['index_a']}_{m['index_b']}": m for m in near_misses}
+        # Normalize for comparison
+        def _norm(a):
+            import re
+            a = a.upper()
+            a = re.sub(r'(\s+#\s*\S+.*|\s+(?:STE|APT|UNIT|FL|BLDG|PMB|SUITE)\b.*)$',
+                       '', a, flags=re.IGNORECASE).strip()
+            a = re.sub(r'[^\w\s]', ' ', a)
+            return re.sub(r'\s+', ' ', a).strip().lower()
 
-    new_rows = []
-    duplicate_pairs = []
+        norm_a = _norm(addr_a) if not addr_a_blank else ''
+        norm_b = _norm(addr_b) if not addr_b_blank else ''
+
+        # AUTO-MERGE: same normalized address (after stripping unit suffixes)
+        if norm_a and norm_b and norm_a == norm_b:
+            auto_merged.append((m['index_a'], m['index_b']))
+            continue
+
+        # LLM: blank addresses or similar addresses (unit diff)
+        llm_pairs.append(DedupPair(
+            pair_id       = f"{m['index_a']}_{m['index_b']}",
+            index_a       = m['index_a'],
+            index_b       = m['index_b'],
+            name_a        = m['name_a'],
+            address_a     = addr_a,
+            name_b        = m['name_b'],
+            address_b     = addr_b,
+            similarity    = m['similarity'],
+            intra_cluster = False,
+        ))
+
+    # Apply auto-merges
+    if auto_merged:
+        for idx_a, idx_b in auto_merged:
+            rec_a = db.query(CityRecord).filter_by(city_id=city_id, city_index=idx_a).first()
+            rec_b = db.query(CityRecord).filter_by(city_id=city_id, city_index=idx_b).first()
+            if rec_a and rec_b:
+                merged = min(rec_a.cluster_id or rec_a.id, rec_b.cluster_id or rec_b.id)
+                rec_a.cluster_id = merged
+                rec_b.cluster_id = merged
+        db.commit()
+        logger.info(f"Step 0.4: Auto-merged {len(auto_merged)} cross-cluster pairs")
+
+    if not llm_pairs:
+        return len(auto_merged)
+
+    # Send to LLM in one batched call
+    logger.info(f"Step 0.4: Sending {len(llm_pairs)} cross-cluster pairs to LLM...")
+    results = judge_dedup_pairs(llm_pairs)
+
+    pair_meta = {p.pair_id: p for p in llm_pairs}
+    new_db_rows = []
+    llm_merged  = []
 
     for res in results:
-        m = meta.get(res['pair_id'], {})
-        new_rows.append(DedupReviewPair(
-            city_id    = city_id,
-            index_a    = res['index_a'],
-            index_b    = res['index_b'],
-            name_a     = m.get('name_a', ''),
-            address_a  = m.get('address_a', ''),
-            name_b     = m.get('name_b', ''),
-            address_b  = m.get('address_b', ''),
-            similarity = m.get('similarity', 0.0),
-            llm_reason = res.get('reason', ''),
-            decision   = res.get('decision', 'UNCERTAIN'),
-        ))
-        if res.get('decision') == 'DUPLICATE':
-            duplicate_pairs.append((res['index_a'], res['index_b']))
+        p = pair_meta.get(res['pair_id'])
+        if not p:
+            continue
 
-    _bulk_insert(db, new_rows)
+        decision = res.get('decision', 'UNCERTAIN')
 
-    # Auto-merge DUPLICATE decisions
-    if duplicate_pairs:
-        for idx_a, idx_b in duplicate_pairs:
+        if decision == 'DUPLICATE':
+            llm_merged.append((p.index_a, p.index_b))
+        else:
+            # UNCERTAIN or NOT_DUPLICATE → store for human review
+            # (NOT_DUPLICATE also goes to review so human can confirm)
+            new_db_rows.append(DedupReviewPair(
+                city_id       = city_id,
+                index_a       = p.index_a,
+                index_b       = p.index_b,
+                name_a        = p.name_a,
+                address_a     = p.address_a,
+                name_b        = p.name_b,
+                address_b     = p.address_b,
+                similarity    = p.similarity,
+                llm_reason    = res.get('reason', ''),
+                decision      = 'UNCERTAIN' if decision == 'UNCERTAIN' else 'NOT_DUPLICATE',
+                intra_cluster = False,
+            ))
+
+    # Apply LLM-confirmed merges
+    if llm_merged:
+        for idx_a, idx_b in llm_merged:
             rec_a = db.query(CityRecord).filter_by(city_id=city_id, city_index=idx_a).first()
             rec_b = db.query(CityRecord).filter_by(city_id=city_id, city_index=idx_b).first()
             if rec_a and rec_b:
@@ -532,104 +738,15 @@ def _step4_llm_verify_near_misses(near_misses: list[dict],
                 rec_b.cluster_id = merged
         db.commit()
 
-    return len(new_rows)
+    if new_db_rows:
+        _bulk_insert(db, new_db_rows)
+
+    uncertain_count = sum(1 for r in new_db_rows if r.decision == 'UNCERTAIN')
+    logger.info(f"Step 0.4 done: {len(auto_merged)} auto-merged, {len(llm_merged)} LLM-merged, "
+                f"{uncertain_count} sent to human review")
+    return len(auto_merged) + len(results)
 
 
-def _old_run_dedup_llm_pass(df: pd.DataFrame, city_id: int, db: Session,
-                        similarity_threshold: float = 0.85) -> int:
-    """
-    After LSH clustering, find pairs across different clusters with high
-    name similarity — these are potential missed duplicates. Send to LLM,
-    store UNCERTAIN ones for human review.
-
-    Returns count of near-miss pairs found.
-    """
-    from ..db.models import DedupReviewPair
-    from ..core.llm_judge import judge_dedup_pairs, DedupPair
-    from rapidfuzz import fuzz
-
-    # Clear existing dedup review pairs for this city
-    db.query(DedupReviewPair).filter_by(city_id=city_id).delete()
-    db.commit()
-
-    if 'cluster id' not in df.columns or 'norm_name' not in df.columns:
-        return 0
-
-    # Only compare records in different clusters
-    records = df[['city_index', 'cluster id', 'Business Name', 'Address1',
-                  'norm_name', 'norm_address']].copy()
-    records = records.fillna('')
-
-    # Build candidate near-miss pairs using 3-char prefix blocking
-    near_miss_pairs: list[DedupPair] = []
-    seen: set[tuple] = set()
-
-    rows = records.to_dict('records')
-    # Index by first 3 chars of norm_name
-    blocks: dict[str, list] = {}
-    for row in rows:
-        key = str(row['norm_name'])[:3]
-        blocks.setdefault(key, []).append(row)
-
-    for key, block_rows in blocks.items():
-        for i in range(len(block_rows)):
-            for j in range(i + 1, len(block_rows)):
-                a, b = block_rows[i], block_rows[j]
-                # Skip same cluster — already handled
-                if a['cluster id'] == b['cluster id']:
-                    continue
-                pair_key = (min(int(a['city_index']), int(b['city_index'])),
-                            max(int(a['city_index']), int(b['city_index'])))
-                if pair_key in seen:
-                    continue
-                seen.add(pair_key)
-
-                sim = fuzz.token_sort_ratio(a['norm_name'], b['norm_name']) / 100.0
-                if sim >= similarity_threshold:
-                    near_miss_pairs.append(DedupPair(
-                        pair_id   = f"{pair_key[0]}_{pair_key[1]}",
-                        index_a   = pair_key[0],
-                        index_b   = pair_key[1],
-                        name_a    = str(a['Business Name']),
-                        address_a = str(a['Address1']),
-                        name_b    = str(b['Business Name']),
-                        address_b = str(b['Address1']),
-                        similarity= sim,
-                    ))
-
-    if not near_miss_pairs:
-        return 0
-
-    # Judge with LLM
-    results = judge_dedup_pairs(near_miss_pairs)
-
-    # Store all results; UNCERTAIN ones need human review
-    for res in results:
-        db.add(DedupReviewPair(
-            city_id    = city_id,
-            index_a    = res['index_a'],
-            index_b    = res['index_b'],
-            name_a     = next((p.name_a for p in near_miss_pairs if p.pair_id == res['pair_id']), ''),
-            address_a  = next((p.address_a for p in near_miss_pairs if p.pair_id == res['pair_id']), ''),
-            name_b     = next((p.name_b for p in near_miss_pairs if p.pair_id == res['pair_id']), ''),
-            address_b  = next((p.address_b for p in near_miss_pairs if p.pair_id == res['pair_id']), ''),
-            similarity = next((p.similarity for p in near_miss_pairs if p.pair_id == res['pair_id']), 0.0),
-            llm_reason = res.get('reason', ''),
-            decision   = res.get('decision', 'UNCERTAIN'),
-        ))
-
-        # Auto-merge DUPLICATE decisions immediately
-        if res.get('decision') == 'DUPLICATE':
-            from ..db.models import CityRecord
-            rec_a = db.query(CityRecord).filter_by(city_id=city_id, city_index=res['index_a']).first()
-            rec_b = db.query(CityRecord).filter_by(city_id=city_id, city_index=res['index_b']).first()
-            if rec_a and rec_b:
-                merged = min(rec_a.cluster_id or rec_a.id, rec_b.cluster_id or rec_b.id)
-                rec_a.cluster_id = merged
-                rec_b.cluster_id = merged
-
-    db.commit()
-    return len(near_miss_pairs)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -667,22 +784,22 @@ def run_step0(city: City, db: Session, output_dir: str) -> dict:
     # Bulk-ingest city records into DB (needed for matching step)
     _ingest_city_records_bulk(deduped_df, city.id, db)
 
-    # ── Step 2: LLM verifies low-confidence intra-cluster pairs ──────────────
-    logger.info("Step 0.2: LLM verifying low-confidence cluster assignments...")
-    intra_results = _step2_llm_verify_clusters(deduped_df, city.id, db)
-    logger.info(f"Step 0.2 done: verified {len(intra_results)} low-confidence pairs")
+    # ── Step 2: Verify intra-cluster pairs with rules + LLM ──────────────────
+    logger.info("Step 0.2: Verifying cluster assignments...")
+    intra_count = _step2_verify_clusters_with_llm(deduped_df, city.id, db)
+    logger.info(f"Step 0.2 done: {intra_count} pairs processed")
 
     # ── Step 3: Vectorised cross-cluster near-miss scan ───────────────────────
     logger.info("Step 0.3: Scanning for cross-cluster near-misses...")
-    near_misses = _step3_cross_cluster_scan(deduped_df, similarity_threshold=0.85)
+    near_misses = _step3_cross_cluster_scan(deduped_df, similarity_threshold=0.92)
     logger.info(f"Step 0.3 done: {len(near_misses)} near-miss candidates found")
 
-    # ── Step 4: LLM verifies near-miss candidates ─────────────────────────────
+    # ── Step 4: Verify near-misses with rules + LLM ───────────────────────────
     near_miss_count = 0
     if near_misses:
-        logger.info(f"Step 0.4: LLM verifying {len(near_misses)} near-miss pairs...")
-        near_miss_count = _step4_llm_verify_near_misses(near_misses, city.id, db)
-        logger.info(f"Step 0.4 done: {near_miss_count} pairs stored for review")
+        logger.info(f"Step 0.4: Verifying {len(near_misses)} cross-cluster near-miss pairs...")
+        near_miss_count = _step4_verify_near_misses_with_llm(near_misses, city.id, db)
+        logger.info(f"Step 0.4 done: {near_miss_count} pairs processed")
 
     # ── Bludot concatenation ──────────────────────────────────────────────────
     logger.info("Step 0.5: Concatenating bludot sheets...")
@@ -693,12 +810,12 @@ def run_step0(city: City, db: Session, output_dir: str) -> dict:
 
     n_clusters = deduped_df['cluster id'].nunique() if 'cluster id' in deduped_df.columns else 0
     return {
-        'city_records'          : len(city_df),
-        'deduped_records'       : len(deduped_df),
-        'clusters'              : n_clusters,
-        'bludot_records'        : len(bludot_df),
-        'low_conf_intra_pairs'  : len(intra_results),
-        'near_miss_pairs'       : near_miss_count,
+        'city_records'    : len(city_df),
+        'deduped_records' : len(deduped_df),
+        'clusters'        : n_clusters,
+        'bludot_records'  : len(bludot_df),
+        'intra_pairs'     : intra_count,
+        'near_miss_pairs' : near_miss_count,
     }
 
 

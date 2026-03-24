@@ -183,13 +183,13 @@ def _continue_after_dedup(city, city_id, results_dir, db, run):
 
     # ── Step 2: Matching + LLM judge ──────────────────────────────────────
     _log_step(db, run, "step2_match", "running", "Generating match candidates…")
-    candidates = generate_candidates(db, city_id, match_pass=1)
+    candidate_count = generate_candidates(db, city_id, match_pass=1)
     _log_step(db, run, "step2_match", "running",
-              f"Running LLM judge on {len(candidates)} candidates…",
-              stats={"candidates": len(candidates)})
+              f"Running LLM judge on {candidate_count} candidates…",
+              stats={"candidates": candidate_count})
     llm_stats = run_llm_judge(db, city_id, match_pass=1)
     _log_step(db, run, "step2_match", "completed", "Matching complete",
-              stats={**llm_stats, "candidates": len(candidates)})
+              stats={**llm_stats, "candidates": candidate_count})
 
     # ── Gate: human review ────────────────────────────────────────────────
     uncertain = get_review_queue(db, city_id, match_pass=1)
@@ -215,12 +215,12 @@ def _post_review(city, city_id, results_dir, db, run):
 
     # Step 4.1: second-pass matching
     _log_step(db, run, "step4_1_extra_match", "running", "Second-pass matching…")
-    candidates2 = generate_candidates(db, city_id, match_pass=2)
-    if candidates2:
+    candidate_count2 = generate_candidates(db, city_id, match_pass=2)
+    if candidate_count2:
         llm_stats2 = run_llm_judge(db, city_id, match_pass=2)
         _log_step(db, run, "step4_1_extra_match", "completed",
-                  f"{len(candidates2)} candidates processed",
-                  stats={**llm_stats2, "candidates": len(candidates2)})
+                  f"{candidate_count2} candidates processed",
+                  stats={**llm_stats2, "candidates": candidate_count2})
         uncertain2 = get_review_queue(db, city_id, match_pass=2)
         if uncertain2:
             _log_step(db, run, "step4_1_review", "paused",

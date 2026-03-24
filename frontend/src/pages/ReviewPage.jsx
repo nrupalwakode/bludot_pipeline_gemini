@@ -2,60 +2,99 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useParams, useNavigate, useSearchParams, Link } from "react-router-dom";
 import { API } from "../hooks/useApi";
 
+/**
+ * ReviewPage handles TWO review modes:
+ *
+ * 1. DEDUP mode  — pipeline paused at step0_dedup_review
+ *    Endpoint: GET/POST /cities/{id}/dedup-review
+ *    Decision: "DUPLICATE" | "NOT_DUPLICATE"
+ *    Items have: pair_id, name_a, address_a, name_b, address_b, similarity, llm_reason
+ *
+ * 2. MATCH mode  — pipeline paused at step2_review or step4_1_review
+ *    Endpoint: GET /cities/{id}/review?match_pass=N
+ *    Decision: accepted (true/false)
+ *    Items have: candidate_id, city_record, bludot_record, name_score, address_score, llm_reason
+ */
 export default function ReviewPage() {
-  const { cityId }        = useParams();
-  const navigate          = useNavigate();
-  const [searchParams]    = useSearchParams();
-  const matchPass         = parseInt(searchParams.get("pass") || "1");
+  const { cityId }      = useParams();
+  const navigate        = useNavigate();
+  const [searchParams]  = useSearchParams();
+  const matchPass       = parseInt(searchParams.get("pass") || "1");
 
-  const [items,      setItems]      = useState([]);
+  const [mode,          setMode]          = useState(null);
+  const [activePass,    setActivePass]    = useState(matchPass);  // persists for reloads
+  const [items,         setItems]         = useState([]);
   const [index,      setIndex]      = useState(0);
   const [loading,    setLoading]    = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [cityName,   setCityName]   = useState("");
-  const [decisions,  setDecisions]  = useState({});  // candidateId → true/false
+  const [decisions,  setDecisions]  = useState({});
   const [note,       setNote]       = useState("");
-  const [filter,     setFilter]     = useState("all"); // all | uncertain
+  const [filter,     setFilter]     = useState("all");
   const [done,       setDone]       = useState(false);
   const noteRef = useRef(null);
 
-  // Load review queue
+  // Detect mode from pipeline status, then load items
   useEffect(() => {
-    Promise.all([
-      API.get(`/cities/${cityId}/review?match_pass=${matchPass}`),
-      API.get(`/cities/${cityId}`),
-    ]).then(([reviewData, cityData]) => {
-      setItems(reviewData.items || []);
-      setCityName(cityData.name);
-    }).finally(() => setLoading(false));
+    async function load() {
+      try {
+        const [cityData, statusData] = await Promise.all([
+          API.get(`/cities/${cityId}`),
+          API.get(`/cities/${cityId}/status`),
+        ]);
+        setCityName(cityData.name);
+
+        const currentStep = statusData.current_step || "";
+        const isDedup = currentStep === "step0_dedup_review";
+        // Detect pass from pipeline step if not in URL
+        const passFromStep = currentStep === "step4_1_review" ? 2 : 1;
+        const effectivePass = parseInt(searchParams.get("pass") || String(passFromStep));
+        setActivePass(effectivePass);
+
+        if (isDedup) {
+          setMode("dedup");
+          const dedupData = await API.get(`/cities/${cityId}/dedup-review`);
+          setItems(dedupData.items || []);
+        } else {
+          setMode("match");
+          const reviewData = await API.get(`/cities/${cityId}/review?match_pass=${effectivePass}`);
+          setItems(reviewData.items || []);
+        }
+      } finally {
+        setLoading(false);
+      }
+    }
+    load();
   }, [cityId, matchPass]);
+
+  const itemId = (item) => mode === "dedup" ? item.pair_id : item.candidate_id;
 
   const filteredItems = filter === "all"
     ? items
-    : items.filter(it => !decisions[it.candidate_id]);
+    : items.filter(it => decisions[itemId(it)] === undefined);
 
-  const current = filteredItems[index];
-  const total   = filteredItems.length;
-  const reviewed = Object.keys(decisions).length;
-  const remaining = items.filter(it => decisions[it.candidate_id] === undefined).length;
+  const current   = filteredItems[index];
+  const total     = filteredItems.length;
+  const reviewed  = Object.keys(decisions).length;
+  const remaining = items.filter(it => decisions[itemId(it)] === undefined).length;
 
   // Keyboard shortcuts
   useEffect(() => {
     function onKey(e) {
       if (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
-      if (e.key === "a" || e.key === "ArrowRight") handleDecide(true);
-      if (e.key === "r" || e.key === "ArrowLeft")  handleDecide(false);
+      if (e.key === "a" || e.key === "ArrowRight") handleDecide(mode === "dedup" ? "DUPLICATE"     : true);
+      if (e.key === "r" || e.key === "ArrowLeft")  handleDecide(mode === "dedup" ? "NOT_DUPLICATE" : false);
       if (e.key === "ArrowDown" && index < total - 1) { setIndex(i => i + 1); setNote(""); }
       if (e.key === "ArrowUp"   && index > 0)          { setIndex(i => i - 1); setNote(""); }
       if (e.key === "n") noteRef.current?.focus();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, total, current]);
+  }, [index, total, current, mode]);
 
-  function handleDecide(accepted) {
+  function handleDecide(value) {
     if (!current) return;
-    setDecisions(d => ({ ...d, [current.candidate_id]: accepted }));
+    setDecisions(d => ({ ...d, [itemId(current)]: value }));
     if (index < total - 1) { setIndex(i => i + 1); setNote(""); }
   }
 
@@ -63,18 +102,30 @@ export default function ReviewPage() {
     if (Object.keys(decisions).length === 0) return;
     setSubmitting(true);
     try {
-      await API.post(`/cities/${cityId}/review/bulk`, {
-        decisions,
-        reviewer: "human",
-      });
-      // Check if all items reviewed
-      const remaining = items.filter(it => decisions[it.candidate_id] === undefined).length;
-      if (remaining === 0) {
+      if (mode === "dedup") {
+        await API.post(`/cities/${cityId}/dedup-review/bulk`, {
+          decisions,   // {pair_id: "DUPLICATE"|"NOT_DUPLICATE"}
+          reviewer: "human",
+        });
+      } else {
+        await API.post(`/cities/${cityId}/review/bulk`, {
+          decisions,   // {candidate_id: true|false}
+          reviewer: "human",
+        });
+      }
+
+      const stillRemaining = items.filter(it => decisions[itemId(it)] === undefined).length;
+      if (stillRemaining === 0) {
         setDone(true);
       } else {
-        // Reload queue
-        const data = await API.get(`/cities/${cityId}/review?match_pass=${matchPass}`);
-        setItems(data.items || []);
+        // Reload
+        if (mode === "dedup") {
+          const data = await API.get(`/cities/${cityId}/dedup-review`);
+          setItems(data.items || []);
+        } else {
+          const data = await API.get(`/cities/${cityId}/review?match_pass=${activePass}`);
+          setItems(data.items || []);
+        }
         setDecisions({});
         setIndex(0);
       }
@@ -98,7 +149,7 @@ export default function ReviewPage() {
         <div style={{ fontSize: 48, marginBottom: 16 }}>🎉</div>
         <h2>No items to review</h2>
         <p className="text-muted" style={{ marginTop: 8 }}>
-          All match candidates were resolved automatically.
+          All {mode === "dedup" ? "deduplication pairs" : "match candidates"} were resolved automatically.
         </p>
         <Link to={`/city/${cityId}`} className="btn btn-primary" style={{ marginTop: 24 }}>
           ← Back to Pipeline
@@ -107,8 +158,12 @@ export default function ReviewPage() {
     </div>
   );
 
-  const accepted = Object.values(decisions).filter(Boolean).length;
-  const rejected = Object.values(decisions).filter(v => v === false).length;
+  const modeLabel   = mode === "dedup" ? "Dedup Review" : `Match Review (Pass ${matchPass})`;
+  const acceptLabel = mode === "dedup" ? "Duplicate (A)" : "Accept (A)";
+  const rejectLabel = mode === "dedup" ? "Not Duplicate (R)" : "Reject (R)";
+
+  const accepted = Object.values(decisions).filter(v => v === true || v === "DUPLICATE").length;
+  const rejected = Object.values(decisions).filter(v => v === false || v === "NOT_DUPLICATE").length;
 
   return (
     <div>
@@ -118,11 +173,10 @@ export default function ReviewPage() {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           <h1>Review Queue</h1>
-          <span className="badge badge-paused">Pass {matchPass}</span>
+          <span className="badge badge-paused">{modeLabel}</span>
         </div>
 
-        <div style={{ display: "flex", align: "center", gap: 12 }}>
-          {/* Filter */}
+        <div style={{ display: "flex", gap: 12 }}>
           <div style={{ display: "flex", gap: 4, background: "var(--surface2)", padding: 3, borderRadius: 7, border: "1px solid var(--border)" }}>
             {["all", "unreviewed"].map(f => (
               <button key={f} onClick={() => { setFilter(f); setIndex(0); }}
@@ -138,7 +192,6 @@ export default function ReviewPage() {
             ))}
           </div>
 
-          {/* Submit */}
           <button
             className="btn btn-primary"
             disabled={Object.keys(decisions).length === 0 || submitting}
@@ -155,10 +208,10 @@ export default function ReviewPage() {
       <div style={{ marginBottom: 20 }}>
         <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
           <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
-            {index + 1} of {total} · {accepted} accepted · {rejected} rejected · {remaining} remaining
+            {index + 1} of {total} · {accepted} {mode === "dedup" ? "duplicates" : "accepted"} · {rejected} {mode === "dedup" ? "not duplicates" : "rejected"} · {remaining} remaining
           </span>
           <span style={{ fontSize: 12, fontFamily: "IBM Plex Mono, monospace", color: "var(--text-muted)" }}>
-            A/→ accept · R/← reject · N note · ↑↓ navigate
+            A/→ {mode === "dedup" ? "duplicate" : "accept"} · R/← {mode === "dedup" ? "not duplicate" : "reject"} · N note · ↑↓ navigate
           </span>
         </div>
         <div className="progress-bar">
@@ -169,16 +222,11 @@ export default function ReviewPage() {
       {/* Navigator */}
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <button className="btn btn-ghost btn-sm" disabled={index === 0}
-          onClick={() => { setIndex(i => i - 1); setNote(""); }}>
-          ← Prev
-        </button>
+          onClick={() => { setIndex(i => i - 1); setNote(""); }}>← Prev</button>
         <button className="btn btn-ghost btn-sm" disabled={index >= total - 1}
-          onClick={() => { setIndex(i => i + 1); setNote(""); }}>
-          Next →
-        </button>
+          onClick={() => { setIndex(i => i + 1); setNote(""); }}>Next →</button>
         <input
-          type="number" min={1} max={total}
-          value={index + 1}
+          type="number" min={1} max={total} value={index + 1}
           onChange={e => { const v = parseInt(e.target.value) - 1; if (v >= 0 && v < total) setIndex(v); }}
           style={{ width: 70, padding: "4px 8px", fontSize: 12 }}
         />
@@ -186,27 +234,129 @@ export default function ReviewPage() {
       </div>
 
       {current && (
-        <ReviewCard
-          item={current}
-          decision={decisions[current.candidate_id]}
-          note={note}
-          noteRef={noteRef}
-          onNote={setNote}
-          onAccept={() => handleDecide(true)}
-          onReject={() => handleDecide(false)}
-          onUndo={() => setDecisions(d => { const copy = {...d}; delete copy[current.candidate_id]; return copy; })}
-        />
+        mode === "dedup"
+          ? <DedupCard
+              item={current}
+              decision={decisions[itemId(current)]}
+              note={note}
+              noteRef={noteRef}
+              onNote={setNote}
+              onDuplicate={() => handleDecide("DUPLICATE")}
+              onNotDuplicate={() => handleDecide("NOT_DUPLICATE")}
+              onUndo={() => setDecisions(d => { const c = {...d}; delete c[itemId(current)]; return c; })}
+            />
+          : <MatchCard
+              item={current}
+              decision={decisions[itemId(current)]}
+              note={note}
+              noteRef={noteRef}
+              onNote={setNote}
+              onAccept={() => handleDecide(true)}
+              onReject={() => handleDecide(false)}
+              onUndo={() => setDecisions(d => { const c = {...d}; delete c[itemId(current)]; return c; })}
+            />
       )}
 
-      {/* Queue thumbnails */}
-      <QueueStrip items={filteredItems} current={index} decisions={decisions} onSelect={i => { setIndex(i); setNote(""); }} />
+      <QueueStrip
+        items={filteredItems}
+        current={index}
+        decisions={decisions}
+        mode={mode}
+        getId={itemId}
+        onSelect={i => { setIndex(i); setNote(""); }}
+      />
     </div>
   );
 }
 
-// ── Review Card ─────────────────────────────────────────────────────────────
+// ── Dedup Review Card ────────────────────────────────────────────────────────
 
-function ReviewCard({ item, decision, note, noteRef, onNote, onAccept, onReject, onUndo }) {
+function DedupCard({ item, decision, note, noteRef, onNote, onDuplicate, onNotDuplicate, onUndo }) {
+  const borderColor =
+    decision === "DUPLICATE"     ? "var(--success)" :
+    decision === "NOT_DUPLICATE" ? "var(--danger)"  : "var(--border)";
+
+  return (
+    <div style={{
+      border: `1.5px solid ${borderColor}`, borderRadius: 12,
+      overflow: "hidden", transition: "border-color 0.2s", marginBottom: 16,
+    }}>
+      {/* Decision banner */}
+      {decision !== undefined && (
+        <div style={{
+          padding: "8px 20px",
+          background: decision === "DUPLICATE" ? "rgba(52,211,153,0.12)" : "rgba(248,113,113,0.12)",
+          borderBottom: `1px solid ${borderColor}`,
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+        }}>
+          <span style={{ fontWeight: 600, color: borderColor, fontSize: 13 }}>
+            {decision === "DUPLICATE" ? "✓ Duplicate — will merge clusters" : "✗ Not Duplicate — different businesses"}
+          </span>
+          <button className="btn btn-ghost btn-sm" onClick={onUndo}>↩ Undo</button>
+        </div>
+      )}
+
+      {/* Side-by-side */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 1fr" }}>
+        <RecordPanel label="Record A" record={{ name: item.name_a, address: item.address_a, raw: {} }} color="var(--accent)" />
+
+        {/* Middle — similarity score */}
+        <div style={{
+          background: "var(--surface2)", borderLeft: "1px solid var(--border)",
+          borderRight: "1px solid var(--border)",
+          display: "flex", flexDirection: "column", alignItems: "center",
+          justifyContent: "center", gap: 8, padding: "12px 4px",
+        }}>
+          <ScorePip label="Sim" value={Math.round((item.similarity || 0) * 100)} />
+          <div style={{ fontSize: 9, color: "var(--text-muted)", textAlign: "center", lineHeight: 1.4 }}>
+            {item.intra_cluster ? "Same\nCluster" : "Diff\nCluster"}
+          </div>
+        </div>
+
+        <RecordPanel label="Record B" record={{ name: item.name_b, address: item.address_b, raw: {} }} color="var(--accent2)" />
+      </div>
+
+      {/* Reason */}
+      <div style={{
+        padding: "12px 20px", background: "var(--surface2)",
+        borderTop: "1px solid var(--border)",
+      }}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px", marginRight: 10 }}>
+          Reason
+        </span>
+        <span style={{ fontSize: 13, color: "var(--text)", fontStyle: "italic" }}>
+          {item.llm_reason || "—"}
+        </span>
+      </div>
+
+      {/* Action buttons */}
+      <div style={{
+        padding: "14px 20px", background: "var(--surface)",
+        borderTop: "1px solid var(--border)",
+        display: "flex", gap: 12, alignItems: "center",
+      }}>
+        <textarea
+          ref={noteRef}
+          placeholder="Optional note (press N to focus)"
+          value={note}
+          onChange={e => onNote(e.target.value)}
+          rows={1}
+          style={{ flex: 1, resize: "none", fontSize: 12, padding: "7px 10px" }}
+        />
+        <button className="btn btn-danger" style={{ minWidth: 140 }} onClick={onNotDuplicate}>
+          ✗ Not Duplicate (R)
+        </button>
+        <button className="btn btn-success" style={{ minWidth: 130 }} onClick={onDuplicate}>
+          ✓ Duplicate (A)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Match Review Card ────────────────────────────────────────────────────────
+
+function MatchCard({ item, decision, note, noteRef, onNote, onAccept, onReject, onUndo }) {
   const cr = item.city_record;
   const br = item.bludot_record;
 
@@ -216,12 +366,9 @@ function ReviewCard({ item, decision, note, noteRef, onNote, onAccept, onReject,
 
   return (
     <div style={{
-      border: `1.5px solid ${borderColor}`,
-      borderRadius: 12, overflow: "hidden",
-      transition: "border-color 0.2s",
-      marginBottom: 16,
+      border: `1.5px solid ${borderColor}`, borderRadius: 12,
+      overflow: "hidden", transition: "border-color 0.2s", marginBottom: 16,
     }}>
-      {/* Decision banner */}
       {decision !== undefined && (
         <div style={{
           padding: "8px 20px",
@@ -229,18 +376,16 @@ function ReviewCard({ item, decision, note, noteRef, onNote, onAccept, onReject,
           borderBottom: `1px solid ${borderColor}`,
           display: "flex", alignItems: "center", justifyContent: "space-between",
         }}>
-          <span style={{ fontWeight: 600, color: decision ? "var(--success)" : "var(--danger)", fontSize: 13 }}>
+          <span style={{ fontWeight: 600, color: borderColor, fontSize: 13 }}>
             {decision ? "✓ Accepted" : "✗ Rejected"}
           </span>
           <button className="btn btn-ghost btn-sm" onClick={onUndo}>↩ Undo</button>
         </div>
       )}
 
-      {/* Side-by-side records */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 60px 1fr" }}>
         <RecordPanel label="City Record" record={{ name: cr.business_name, address: cr.address1, raw: cr.raw_data }} color="var(--accent)" />
 
-        {/* Middle scores */}
         <div style={{
           background: "var(--surface2)", borderLeft: "1px solid var(--border)",
           borderRight: "1px solid var(--border)",
@@ -256,10 +401,8 @@ function ReviewCard({ item, decision, note, noteRef, onNote, onAccept, onReject,
         <RecordPanel label="Bludot Record" record={{ name: br.name, address: br.address1, raw: br.raw_data }} color="var(--accent2)" />
       </div>
 
-      {/* LLM reasoning */}
       <div style={{
-        padding: "12px 20px",
-        background: "var(--surface2)",
+        padding: "12px 20px", background: "var(--surface2)",
         borderTop: "1px solid var(--border)",
         display: "flex", flexDirection: "column", gap: 8,
       }}>
@@ -281,10 +424,8 @@ function ReviewCard({ item, decision, note, noteRef, onNote, onAccept, onReject,
         </div>
       </div>
 
-      {/* Note + action buttons */}
       <div style={{
-        padding: "14px 20px",
-        background: "var(--surface)",
+        padding: "14px 20px", background: "var(--surface)",
         borderTop: "1px solid var(--border)",
         display: "flex", gap: 12, alignItems: "center",
       }}>
@@ -296,24 +437,14 @@ function ReviewCard({ item, decision, note, noteRef, onNote, onAccept, onReject,
           rows={1}
           style={{ flex: 1, resize: "none", fontSize: 12, padding: "7px 10px" }}
         />
-        <button
-          className="btn btn-danger"
-          style={{ minWidth: 100 }}
-          onClick={onReject}
-        >
-          ✗ Reject (R)
-        </button>
-        <button
-          className="btn btn-success"
-          style={{ minWidth: 100 }}
-          onClick={onAccept}
-        >
-          ✓ Accept (A)
-        </button>
+        <button className="btn btn-danger"  style={{ minWidth: 100 }} onClick={onReject}>✗ Reject (R)</button>
+        <button className="btn btn-success" style={{ minWidth: 100 }} onClick={onAccept}>✓ Accept (A)</button>
       </div>
     </div>
   );
 }
+
+// ── Shared components ────────────────────────────────────────────────────────
 
 function RecordPanel({ label, record, color }) {
   const [expanded, setExpanded] = useState(false);
@@ -321,7 +452,7 @@ function RecordPanel({ label, record, color }) {
 
   const SKIP_KEYS = ["city_index", "bludot_index", "cluster id", "norm_name",
                      "norm_address", "is_po_box", "po_box_num", "street_num",
-                     "street_name", "business_address"];
+                     "street_name", "business_address", "lsh_bucket"];
 
   const extraFields = Object.entries(raw)
     .filter(([k]) => !SKIP_KEYS.includes(k) && k !== "Business Name" && k !== "Address1"
@@ -332,31 +463,23 @@ function RecordPanel({ label, record, color }) {
       <div style={{ fontSize: 11, fontWeight: 600, color, textTransform: "uppercase", letterSpacing: "0.6px", marginBottom: 12 }}>
         {label}
       </div>
-
       <div style={{ marginBottom: 6 }}>
         <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 2 }}>Business Name</div>
-        <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text)" }}>
-          {record.name || "—"}
-        </div>
+        <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text)" }}>{record.name || "—"}</div>
       </div>
-
       <div style={{ marginBottom: 10 }}>
         <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 2 }}>Address</div>
         <div style={{ fontSize: 13, color: "var(--text)" }}>
           {record.address || <span style={{ color: "var(--text-muted)", fontStyle: "italic" }}>blank</span>}
         </div>
       </div>
-
       {extraFields.length > 0 && (
         <>
-          <button
-            onClick={() => setExpanded(e => !e)}
-            style={{
-              background: "none", border: "none", cursor: "pointer",
-              color: "var(--text-muted)", fontSize: 11, padding: 0,
-              display: "flex", alignItems: "center", gap: 4,
-            }}
-          >
+          <button onClick={() => setExpanded(e => !e)} style={{
+            background: "none", border: "none", cursor: "pointer",
+            color: "var(--text-muted)", fontSize: 11, padding: 0,
+            display: "flex", alignItems: "center", gap: 4,
+          }}>
             {expanded ? "▾" : "▸"} {extraFields.length} more fields
           </button>
           {expanded && (
@@ -391,8 +514,7 @@ function ScorePip({ label, value }) {
           width: 22, height: 22, borderRadius: "50%",
           background: "var(--surface2)",
           display: "flex", alignItems: "center", justifyContent: "center",
-          fontSize: 9, fontWeight: 700, fontFamily: "IBM Plex Mono, monospace",
-          color,
+          fontSize: 9, fontWeight: 700, fontFamily: "IBM Plex Mono, monospace", color,
         }}>
           {Math.round(pct)}
         </div>
@@ -404,51 +526,37 @@ function ScorePip({ label, value }) {
 
 function StreetNumBadge({ match }) {
   if (match === null || match === undefined) {
-    return (
-      <div style={{ fontSize: 9, color: "var(--text-muted)", textAlign: "center", lineHeight: 1.3 }}>
-        ST#<br/>blank
-      </div>
-    );
+    return <div style={{ fontSize: 9, color: "var(--text-muted)", textAlign: "center", lineHeight: 1.3 }}>ST#<br/>blank</div>;
   }
   return (
-    <div style={{
-      fontSize: 9, fontWeight: 700, color: match ? "var(--success)" : "var(--danger)",
-      textAlign: "center", lineHeight: 1.3,
-    }}>
+    <div style={{ fontSize: 9, fontWeight: 700, color: match ? "var(--success)" : "var(--danger)", textAlign: "center", lineHeight: 1.3 }}>
       ST#<br/>{match ? "✓" : "✗"}
     </div>
   );
 }
 
-// ── Queue Strip ──────────────────────────────────────────────────────────────
-
-function QueueStrip({ items, current, decisions, onSelect }) {
+function QueueStrip({ items, current, decisions, mode, getId, onSelect }) {
   return (
-    <div style={{
-      display: "flex", gap: 4, overflowX: "auto",
-      padding: "12px 0", marginTop: 8,
-    }}>
+    <div style={{ display: "flex", gap: 4, overflowX: "auto", padding: "12px 0", marginTop: 8 }}>
       {items.map((item, i) => {
-        const dec = decisions[item.candidate_id];
-        const bg  = dec === true  ? "rgba(52,211,153,0.25)" :
-                    dec === false ? "rgba(248,113,113,0.25)" :
-                    i === current ? "var(--surface2)" : "transparent";
+        const dec = decisions[getId(item)];
+        const isAccepted = dec === true || dec === "DUPLICATE";
+        const isRejected = dec === false || dec === "NOT_DUPLICATE";
+        const bg = isAccepted ? "rgba(52,211,153,0.25)" :
+                   isRejected ? "rgba(248,113,113,0.25)" :
+                   i === current ? "var(--surface2)" : "transparent";
         const border = i === current ? "var(--accent)" :
-                       dec === true  ? "var(--success)" :
-                       dec === false ? "var(--danger)" : "var(--border)";
+                       isAccepted   ? "var(--success)" :
+                       isRejected   ? "var(--danger)"  : "var(--border)";
         return (
-          <button
-            key={item.candidate_id}
-            onClick={() => onSelect(i)}
-            style={{
-              flexShrink: 0, width: 32, height: 32, borderRadius: 6,
-              background: bg, border: `1.5px solid ${border}`,
-              cursor: "pointer", fontSize: 11,
-              fontFamily: "IBM Plex Mono, monospace",
-              color: i === current ? "var(--accent)" : "var(--text-muted)",
-              fontWeight: i === current ? 700 : 400,
-            }}
-          >
+          <button key={getId(item)} onClick={() => onSelect(i)} style={{
+            flexShrink: 0, width: 32, height: 32, borderRadius: 6,
+            background: bg, border: `1.5px solid ${border}`,
+            cursor: "pointer", fontSize: 11,
+            fontFamily: "IBM Plex Mono, monospace",
+            color: i === current ? "var(--accent)" : "var(--text-muted)",
+            fontWeight: i === current ? 700 : 400,
+          }}>
             {i + 1}
           </button>
         );
@@ -456,8 +564,6 @@ function QueueStrip({ items, current, decisions, onSelect }) {
     </div>
   );
 }
-
-// ── Done Screen ──────────────────────────────────────────────────────────────
 
 function DoneScreen({ cityId, cityName, navigate }) {
   return (
@@ -467,22 +573,17 @@ function DoneScreen({ cityId, cityName, navigate }) {
         <div style={{ fontSize: 48, marginBottom: 16 }}>✅</div>
         <h2>Review Complete</h2>
         <p className="text-muted" style={{ marginTop: 8, marginBottom: 28 }}>
-          All pairs have been reviewed. You can now resume the pipeline.
+          All pairs reviewed. You can now resume the pipeline.
         </p>
         <div style={{ display: "flex", gap: 12, justifyContent: "center" }}>
-          <button
-            className="btn btn-primary"
-            style={{ padding: "10px 28px" }}
+          <button className="btn btn-primary" style={{ padding: "10px 28px" }}
             onClick={async () => {
               await API.post(`/cities/${cityId}/resume`);
               navigate(`/city/${cityId}`);
-            }}
-          >
+            }}>
             ▶ Resume Pipeline
           </button>
-          <Link to={`/city/${cityId}`} className="btn btn-ghost">
-            View Dashboard
-          </Link>
+          <Link to={`/city/${cityId}`} className="btn btn-ghost">View Dashboard</Link>
         </div>
       </div>
     </div>

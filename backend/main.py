@@ -37,7 +37,8 @@ from sqlalchemy.orm import Session
 from .db.session import get_db, init_db
 from .db.models import (
     City, PipelineRun, PipelineStatus, PipelineStep,
-    ColumnMapping, MatchCandidate, MatchDecision
+    ColumnMapping, MatchCandidate, MatchDecision,
+    CityRecord, BludotRecord
 )
 from .core.matching_orchestrator import (
     get_review_queue, apply_human_decision, get_match_stats
@@ -89,7 +90,7 @@ class ReviewDecision(BaseModel):
 
 
 class BulkReviewDecision(BaseModel):
-    decisions: dict[int, bool]   # {candidate_id: accepted}
+    decisions: dict[str, bool]   # {candidate_id: accepted}
     reviewer: str = "human"
 
 
@@ -354,6 +355,29 @@ def get_review_items(
     }
 
 
+@app.post("/cities/{city_id}/review/bulk")
+def bulk_review(
+    city_id: int,
+    payload: BulkReviewDecision,
+    db: Session = Depends(get_db),
+):
+    """Submit multiple review decisions at once."""
+    results = []
+    for cand_id_str, accepted in payload.decisions.items():
+        try:
+            cand_id = int(cand_id_str)
+        except (ValueError, TypeError):
+            continue
+        mc = apply_human_decision(db, cand_id, accepted, payload.reviewer)
+        results.append({"candidate_id": cand_id, "decision": mc.final_decision})
+
+    pending = db.query(MatchCandidate).filter_by(
+        city_id=city_id, final_decision=MatchDecision.NEEDS_REVIEW
+    ).count()
+
+    return {"processed": len(results), "remaining": pending, "results": results}
+
+
 @app.post("/cities/{city_id}/review/{candidate_id}")
 def submit_review(
     city_id: int,
@@ -363,40 +387,21 @@ def submit_review(
 ):
     """Submit a single Accept/Reject decision."""
     mc = apply_human_decision(
-        db            = db,
-        candidate_id  = candidate_id,
-        accepted      = decision.accepted,
-        reviewer      = decision.reviewer,
-        note          = decision.note,
+        db           = db,
+        candidate_id = candidate_id,
+        accepted     = decision.accepted,
+        reviewer     = decision.reviewer,
+        note         = decision.note,
     )
     pending = db.query(MatchCandidate).filter_by(
         city_id=city_id, final_decision=MatchDecision.NEEDS_REVIEW
     ).count()
 
     return {
-        "candidate_id"  : candidate_id,
-        "decision"      : mc.final_decision,
-        "remaining"     : pending,
+        "candidate_id": candidate_id,
+        "decision"    : mc.final_decision,
+        "remaining"   : pending,
     }
-
-
-@app.post("/cities/{city_id}/review/bulk")
-def bulk_review(
-    city_id: int,
-    payload: BulkReviewDecision,
-    db: Session = Depends(get_db),
-):
-    """Submit multiple review decisions at once."""
-    results = []
-    for cand_id, accepted in payload.decisions.items():
-        mc = apply_human_decision(db, cand_id, accepted, payload.reviewer)
-        results.append({"candidate_id": cand_id, "decision": mc.final_decision})
-
-    pending = db.query(MatchCandidate).filter_by(
-        city_id=city_id, final_decision=MatchDecision.NEEDS_REVIEW
-    ).count()
-
-    return {"processed": len(results), "remaining": pending, "results": results}
 
 
 # ── Stats endpoint ────────────────────────────────────────────────────────────
@@ -437,7 +442,7 @@ def get_dedup_review(city_id: int, db: Session = Depends(get_db)):
 
 
 class DedupDecisionPayload(BaseModel):
-    decisions: dict[int, str]   # {pair_id: "DUPLICATE" | "NOT_DUPLICATE"}
+    decisions: dict[str, str]   # {pair_id: "DUPLICATE" | "NOT_DUPLICATE"}
     reviewer: str = "human"
 
 
@@ -477,6 +482,206 @@ def submit_dedup_review(
         city_id=city_id, decision=DedupDecision.UNCERTAIN
     ).count()
     return {"processed": len(results), "remaining": pending}
+
+
+# ── Dedup results viewer ──────────────────────────────────────────────────────
+
+@app.get("/cities/{city_id}/dedup-results")
+def get_dedup_results(city_id: int, db: Session = Depends(get_db)):
+    """Return ALL dedup pairs with their decisions for the results viewer."""
+    from .db.models import DedupReviewPair
+    pairs = db.query(DedupReviewPair).filter_by(city_id=city_id).order_by(
+        DedupReviewPair.decision, DedupReviewPair.similarity.desc()
+    ).all()
+    return {
+        "city_id": city_id,
+        "total": len(pairs),
+        "pairs": [
+            {
+                "id"           : p.id,
+                "index_a"      : p.index_a,
+                "index_b"      : p.index_b,
+                "name_a"       : p.name_a,
+                "address_a"    : p.address_a,
+                "name_b"       : p.name_b,
+                "address_b"    : p.address_b,
+                "similarity"   : p.similarity,
+                "decision"     : p.decision,
+                "llm_reason"   : p.llm_reason,
+                "intra_cluster": p.intra_cluster,
+                "reviewed_by"  : p.reviewed_by,
+            }
+            for p in pairs
+        ],
+    }
+
+
+# ── Matches viewer endpoint ───────────────────────────────────────────────────
+
+@app.get("/cities/{city_id}/matches")
+def get_matches(city_id: int, db: Session = Depends(get_db)):
+    """Return all confirmed matched pairs for display in the matches viewer."""
+    candidates = db.query(MatchCandidate).filter(
+        MatchCandidate.city_id == city_id,
+        MatchCandidate.final_decision.in_([
+            MatchDecision.AUTO_MATCH,
+            MatchDecision.HUMAN_ACCEPTED,
+        ])
+    ).order_by(MatchCandidate.id).all()
+
+    matches = []
+    for mc in candidates:
+        cr = db.get(CityRecord, mc.city_rec_id)
+        br = db.get(BludotRecord, mc.bludot_rec_id)
+        if not cr or not br:
+            continue
+        matches.append({
+            "candidate_id"  : mc.id,
+            "city_name"     : cr.business_name,
+            "city_address"  : cr.address1,
+            "bludot_name"   : br.name,
+            "bludot_address": br.address1,
+            "bludot_uuid"   : br.uuid,
+            "final_decision": mc.final_decision,
+            "llm_reason"    : mc.llm_reason,
+            "name_score"    : mc.name_score,
+            "address_score" : mc.address_score,
+        })
+
+    return {"city_id": city_id, "total": len(matches), "matches": matches}
+
+
+# ── Cluster Review endpoints ──────────────────────────────────────────────────
+
+@app.get("/cities/{city_id}/cluster-review")
+def get_cluster_review(city_id: int, db: Session = Depends(get_db)):
+    """Return cluster groups with uncertain pairs for the cluster review UI."""
+    from .db.models import DedupReviewPair, CityRecord
+    from collections import defaultdict
+
+    pairs = db.query(DedupReviewPair).filter_by(
+        city_id=city_id, decision="UNCERTAIN"
+    ).all()
+
+    if not pairs:
+        return {"total_groups": 0, "groups": []}
+
+    # Collect all cluster IDs involved
+    involved = set()
+    for p in pairs:
+        ra = db.query(CityRecord).filter_by(city_id=city_id, city_index=p.index_a).first()
+        rb = db.query(CityRecord).filter_by(city_id=city_id, city_index=p.index_b).first()
+        if ra and ra.cluster_id is not None: involved.add(ra.cluster_id)
+        if rb and rb.cluster_id is not None: involved.add(rb.cluster_id)
+
+    # Union-find to group linked clusters
+    parent = {c: c for c in involved}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        parent[find(x)] = find(y)
+
+    for p in pairs:
+        ra = db.query(CityRecord).filter_by(city_id=city_id, city_index=p.index_a).first()
+        rb = db.query(CityRecord).filter_by(city_id=city_id, city_index=p.index_b).first()
+        if ra and rb and ra.cluster_id is not None and rb.cluster_id is not None:
+            if ra.cluster_id != rb.cluster_id:
+                union(ra.cluster_id, rb.cluster_id)
+
+    root_to_clusters = defaultdict(set)
+    for cid in involved:
+        root_to_clusters[find(cid)].add(cid)
+
+    def cluster_records(cluster_id):
+        recs = db.query(CityRecord).filter_by(city_id=city_id, cluster_id=cluster_id).all()
+        return [{"id": r.id, "city_index": r.city_index,
+                 "business_name": r.business_name, "address1": r.address1}
+                for r in recs]
+
+    groups = []
+    for root, cluster_ids in root_to_clusters.items():
+        clusters = [{"cluster_id": cid, "records": cluster_records(cid)}
+                    for cid in sorted(cluster_ids) if cluster_records(cid)]
+
+        linking_pairs = []
+        for p in pairs:
+            ra = db.query(CityRecord).filter_by(city_id=city_id, city_index=p.index_a).first()
+            rb = db.query(CityRecord).filter_by(city_id=city_id, city_index=p.index_b).first()
+            if not ra or not rb: continue
+            if ra.cluster_id in cluster_ids or rb.cluster_id in cluster_ids:
+                linking_pairs.append({
+                    "pair_id": p.id, "index_a": p.index_a, "index_b": p.index_b,
+                    "name_a": p.name_a, "address_a": p.address_a,
+                    "name_b": p.name_b, "address_b": p.address_b,
+                    "similarity": p.similarity, "reason": p.llm_reason,
+                    "cluster_a": ra.cluster_id, "cluster_b": rb.cluster_id,
+                })
+
+        if clusters:
+            groups.append({"group_id": root, "clusters": clusters, "linking_pairs": linking_pairs})
+
+    return {"total_groups": len(groups), "groups": groups}
+
+
+class MergeClusterPayload(BaseModel):
+    cluster_ids: list[int]
+
+
+@app.post("/cities/{city_id}/cluster-review/merge")
+def merge_clusters(city_id: int, payload: MergeClusterPayload, db: Session = Depends(get_db)):
+    """Merge multiple clusters into one."""
+    from .db.models import CityRecord, DedupReviewPair
+
+    if len(payload.cluster_ids) < 2:
+        raise HTTPException(400, "Need at least 2 cluster IDs to merge")
+
+    target = min(payload.cluster_ids)
+    updated = 0
+    for cid in payload.cluster_ids:
+        if cid == target: continue
+        rows = db.query(CityRecord).filter_by(city_id=city_id, cluster_id=cid).all()
+        for r in rows:
+            r.cluster_id = target
+            updated += 1
+
+    # Mark related pairs as resolved
+    for p in db.query(DedupReviewPair).filter_by(city_id=city_id, decision="UNCERTAIN").all():
+        ra = db.query(CityRecord).filter_by(city_id=city_id, city_index=p.index_a).first()
+        rb = db.query(CityRecord).filter_by(city_id=city_id, city_index=p.index_b).first()
+        if ra and rb:
+            if ra.cluster_id in payload.cluster_ids or rb.cluster_id in payload.cluster_ids:
+                p.decision = "DUPLICATE"
+
+    db.commit()
+    return {"merged_into": target, "records_updated": updated}
+
+
+class KeepSeparatePayload(BaseModel):
+    pair_ids: list[int]
+
+
+@app.post("/cities/{city_id}/cluster-review/keep-separate")
+def keep_separate(city_id: int, payload: KeepSeparatePayload, db: Session = Depends(get_db)):
+    """Mark pairs as NOT_DUPLICATE."""
+    from .db.models import DedupReviewPair
+
+    updated = 0
+    for pid in payload.pair_ids:
+        pair = db.get(DedupReviewPair, pid)
+        if pair and pair.city_id == city_id:
+            pair.decision = "NOT_DUPLICATE"
+            updated += 1
+
+    db.commit()
+    remaining = db.query(DedupReviewPair).filter_by(
+        city_id=city_id, decision="UNCERTAIN"
+    ).count()
+    return {"updated": updated, "remaining_uncertain": remaining}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -90,6 +90,9 @@ export default function CityDetailPage() {
     l => l.step?.includes("review") && l.status === "paused"
   )?.stats?.pending_review || 0;
 
+  const isDedup = status?.current_step === "step0_dedup_review";
+  const reviewPath = isDedup ? `/city/${cityId}/cluster-review` : `/city/${cityId}/review`;
+
   return (
     <div>
       {/* Header */}
@@ -109,16 +112,26 @@ export default function CityDetailPage() {
         </div>
 
         <div style={{ display: "flex", gap: 10 }}>
+          {pipelineStatus === "completed" && (
+            <Link to={`/city/${cityId}/matches`} className="btn btn-primary">
+              ✓ View Matches
+            </Link>
+          )}
+          {pipelineStatus !== "not_started" && (
+            <Link to={`/city/${cityId}/dedup-results`} className="btn" style={{ fontSize: 13 }}>
+              ⊞ Dedup Results
+            </Link>
+          )}
           {pipelineStatus === "not_started" && (
             <button className="btn btn-primary" onClick={handleStart}>▶ Start Pipeline</button>
           )}
           {pipelineStatus === "paused" && (
             <>
-              <Link to={`/city/${cityId}/review`} className="btn" style={{
+              <Link to={reviewPath} className="btn" style={{
                 background: "rgba(245,158,11,0.15)", color: "var(--warn)",
                 border: "1px solid rgba(245,158,11,0.3)"
               }}>
-                ⚑ Review Queue ({pendingReview})
+                ⚑ {isDedup ? "Cluster Review" : "Review Queue"} ({pendingReview})
               </Link>
               <button className="btn btn-primary" onClick={handleResume} disabled={resuming || pendingReview > 0}>
                 {resuming ? <><span className="spinner" /> Resuming…</> : "▶ Resume"}
@@ -136,8 +149,8 @@ export default function CityDetailPage() {
       {pipelineStatus === "paused" && pendingReview > 0 && (
         <div className="alert alert-warn" style={{ marginBottom: 20 }}>
           ⏸ Pipeline is paused — <strong>{pendingReview} record pairs</strong> need human review before continuing.
-          <Link to={`/city/${cityId}/review`} style={{ color: "var(--warn)", marginLeft: 8, fontWeight: 600 }}>
-            Open Review Queue →
+          <Link to={reviewPath} style={{ color: "var(--warn)", marginLeft: 8, fontWeight: 600 }}>
+            Open {isDedup ? "Cluster Review" : "Review Queue"} →
           </Link>
         </div>
       )}
