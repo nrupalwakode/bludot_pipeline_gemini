@@ -54,3 +54,9 @@ coverage/
 
 # Misc
 *.log
+
+.venv/
+uploads/
+backend/uploads/
+*.xlsx
+*.csv

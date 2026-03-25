@@ -1,267 +1,197 @@
 """
-Steps 5 & 6 — Output Sheet Generation
-======================================
-Replaces: step5_business___additional_matched_records.py
-          step6_contacts.py
-          final_sheet_creation.py
-          contact_formatting.py
+Step 5 & 6 — Generate Final Output Sheets
+==========================================
+Replaces: step4_final_matched_sheet.py + step4.1_final_matched_sheet_after_fuzzy_lookup.py
 
-Reads confirmed matches from the DB + the intermediate Excel files,
-applies the user's saved column mapping, and writes:
-
-  results/output/final_output/{CityName}_Business_Matched_Records.xlsx
-    → Business_Matched_Records sheet
-    → Custom_Matched_Records sheet
-    → Contact_Matched_Records sheet
-
-  results/output/final_output/Additional_Matched_Records_Of_{CityName}.xlsx
-    → same 3 sheets, for additional (unmatched) records
-
-The output Business schema is always:
-  ID, Business Name, Address1, Address2, City, State, Country, Zipcode,
-  Phonenumber, Website, is_business, Lat, Long, business_source
+Reads matched records from DB and generates:
+  results/output/final_result/additional_city_records_for_{city}.xlsx
+  results/output/final_result/additional_bludot_records_for_{city}.xlsx
+  results/output/final_output/{city}_Business_Matched_Records.xlsx
+  results/output/final_output/Additional_Matched_Records_Of_{city}.xlsx
 """
 
-import re
-from datetime import datetime
-from pathlib import Path
-
+import logging
 import pandas as pd
-import numpy as np
+from pathlib import Path
 from sqlalchemy.orm import Session
 
-from ..db.models import City, ColumnMapping, MatchCandidate, MatchDecision, CityRecord, BludotRecord
+from ..db.models import (
+    City, CityRecord, BludotRecord, MatchCandidate, MatchDecision
+)
+
+logger = logging.getLogger(__name__)
 
 
-# ── Fixed output schema ───────────────────────────────────────────────────────
+def _get_all_confirmed_matches(db: Session, city_id: int) -> list[dict]:
+    """Return all confirmed matched pairs (AUTO + HUMAN) from both passes."""
+    candidates = db.query(MatchCandidate).filter(
+        MatchCandidate.city_id == city_id,
+        MatchCandidate.final_decision.in_([
+            MatchDecision.AUTO_MATCH,
+            MatchDecision.HUMAN_ACCEPTED,
+        ])
+    ).all()
 
-BUSINESS_OUTPUT_COLS = [
-    'ID', 'Business Name', 'Address1', 'Address2', 'City', 'State',
-    'Country', 'Zipcode', 'Phonenumber', 'Website',
-    'is_business', 'Lat', 'Long', 'business_source',
-]
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _city_prefix(city_name: str) -> str:
-    """e.g. 'Medford_OR_10_05_2025' → 'MED'"""
-    return city_name.split('_')[0][:3].upper()
-
-
-def _date_str() -> str:
-    now = datetime.now()
-    return f"{now.strftime('%d')}{now.strftime('%m')}{now.year}"
-
-
-def _generate_ids(n: int, city_name: str, prefix_override: str = None) -> list[str]:
-    prefix = prefix_override or (_city_prefix(city_name) + _date_str())
-    pad = len(str(n))
-    return [f"{prefix}{str(i).zfill(pad)}" for i in range(1, n + 1)]
-
-
-def _load_column_mappings(db: Session, city_id: int) -> dict:
-    """Returns {source_col: target_col} for mapping_type='business'."""
-    rows = db.query(ColumnMapping).filter_by(city_id=city_id, mapping_type='business').all()
-    return {r.source_col: r.target_col for r in rows}
-
-
-def _load_contact_mappings(db: Session, city_id: int) -> list[dict]:
-    """Returns list of {source_col, role, contact_type, person_col}."""
-    rows = db.query(ColumnMapping).filter_by(city_id=city_id, mapping_type='contact').all()
-    result = []
-    for r in rows:
-        meta = r.meta or {}
-        result.append({
-            'source_col':   r.source_col,
-            'role':         meta.get('role', 'Contact'),
-            'contact_type': meta.get('contact_type', 'email'),
-            'person_col':   meta.get('person_col', ''),
-        })
-    return result
-
-
-def _load_custom_mappings(db: Session, city_id: int) -> list[dict]:
-    """Returns list of {source_col, target_col, bludot_custom_col}."""
-    rows = db.query(ColumnMapping).filter_by(city_id=city_id, mapping_type='custom').all()
-    result = []
-    for r in rows:
-        meta = r.meta or {}
-        result.append({
-            'source_col':       r.source_col,
-            'target_col':       r.target_col,
-            'bludot_custom_col': meta.get('bludot_custom_col', ''),
-        })
-    return result
-
-
-def _apply_business_mapping(raw_row: dict, biz_map: dict) -> dict:
-    """Apply business field mapping to a raw row dict → output row dict."""
-    out = {col: '' for col in BUSINESS_OUTPUT_COLS}
-    for src, tgt in biz_map.items():
-        if tgt in BUSINESS_OUTPUT_COLS and src in raw_row:
-            out[tgt] = raw_row.get(src, '')
-    return out
-
-
-# ── Step 5: Business + Custom sheets ─────────────────────────────────────────
-
-def _build_business_df(records: list[dict], biz_map: dict, city_name: str,
-                       is_additional: bool = False) -> pd.DataFrame:
-    rows = [_apply_business_mapping(r, biz_map) for r in records]
-    df = pd.DataFrame(rows, columns=BUSINESS_OUTPUT_COLS)
-    df['is_business'] = 'TRUE'
-    df['business_source'] = 'CITY' if is_additional else 'BLUDOT'
-    df['ID'] = _generate_ids(len(df), city_name)
-    return df
-
-
-def _build_custom_df(records: list[dict], custom_map: list[dict],
-                     bludot_rows: list[dict] | None, city_name: str,
-                     is_additional: bool = False) -> pd.DataFrame:
-    """Build custom data sheet from city columns + optional bludot custom cols."""
-    if not custom_map:
-        return pd.DataFrame()
-
-    output_rows = []
-    for i, city_row in enumerate(records):
-        out = {}
-        for m in custom_map:
-            val = city_row.get(m['source_col'], '')
-            # Merge with bludot custom value if mapped
-            if m['bludot_custom_col'] and bludot_rows and i < len(bludot_rows):
-                bval = bludot_rows[i].get(m['bludot_custom_col'], '')
-                val = bval if bval and not val else val
-            out[m['target_col']] = val
-        output_rows.append(out)
-
-    df = pd.DataFrame(output_rows)
-    df.insert(0, 'ID', _generate_ids(len(df), city_name))
-    return df
-
-
-# ── Step 6: Contact sheet ─────────────────────────────────────────────────────
-
-def _build_contact_df(records: list[dict], contact_map: list[dict],
-                      city_name: str) -> pd.DataFrame:
-    """
-    Build contact sheet.
-    Each contact_map entry = one contact column from the city sheet.
-    Output columns: ID, Name, Title, Roles, Contact, Contact_type, Type
-    """
-    if not contact_map:
-        return pd.DataFrame()
-
-    output_rows = []
-    for city_row in records:
-        # Group by person_col to merge entries for the same person
-        person_groups: dict[str, list] = {}
-        for m in contact_map:
-            val = str(city_row.get(m['source_col'], '')).strip()
-            if not val:
-                continue
-            person_col_val = str(city_row.get(m['person_col'], '')).strip() if m['person_col'] else ''
-            key = person_col_val or m['role']
-            if key not in person_groups:
-                person_groups[key] = {
-                    'name':  person_col_val,
-                    'role':  m['role'],
-                    'items': [],
-                }
-            person_groups[key]['items'].append({
-                'contact':      val,
-                'contact_type': m['contact_type'],
-                'type':         m['role'],
-            })
-
-        if not person_groups:
-            output_rows.append({'Name': '', 'Title': '', 'Roles': '',
-                                 'Contact': '', 'Contact_type': '', 'Type': ''})
+    rows = []
+    for mc in candidates:
+        cr = db.get(CityRecord,  mc.city_rec_id)
+        br = db.get(BludotRecord, mc.bludot_rec_id)
+        if not cr or not br:
             continue
-
-        for person_key, person_data in person_groups.items():
-            for item in person_data['items']:
-                output_rows.append({
-                    'Name':         person_data['name'],
-                    'Title':        '',
-                    'Roles':        person_data['role'],
-                    'Contact':      item['contact'],
-                    'Contact_type': item['contact_type'],
-                    'Type':         item['type'],
-                })
-
-    df = pd.DataFrame(output_rows)
-    if df.empty:
-        return df
-    df.insert(0, 'ID', _generate_ids(len(df), city_name))
-    return df
+        rows.append({
+            "city_index"   : cr.city_index,
+            "bludot_index" : br.bludot_index,
+            "city_name"    : cr.business_name,
+            "city_address" : cr.address1,
+            "bludot_name"  : br.name,
+            "bludot_address": br.address1,
+            "bludot_uuid"  : br.uuid,
+            "match_pass"   : mc.match_pass,
+            "final_decision": mc.final_decision,
+            "llm_reason"   : mc.llm_reason or "",
+        })
+    return rows
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def run_step5_and_step6(city: City, db: Session, output_dir: str) -> dict:
+def _separate_main_spreadsheet(matched_df, city_df, bludot_df):
     """
-    Entry point called by the pipeline.
-    Generates all final output Excel files.
+    From step4_final_matched_sheet.py — split out the UNMATCHED records.
+    Returns (additional_city, additional_bludot) — records not in matched set.
     """
-    output_dir = Path(output_dir)
-    final_result_dir = output_dir / 'output' / 'final_result'
-    final_output_dir = output_dir / 'output' / 'final_output'
-    final_output_dir.mkdir(parents=True, exist_ok=True)
+    additional_city   = city_df[~city_df['city_index'].isin(matched_df['city_index'].values)]
+    additional_bludot = bludot_df[~bludot_df['bludot_index'].isin(matched_df['bludot_index'].values)]
+    return additional_city.reset_index(drop=True), additional_bludot.reset_index(drop=True)
+
+
+def run_step5_and_step6(city: City, db: Session, results_dir: str) -> dict:
+    """
+    Entry point called by pipeline.py
+
+    Reads:  DB match candidates + city/bludot records from DB
+    Writes: final output Excel files
+    """
+    results_path = Path(results_dir)
+    city_data_dir   = results_path / 'city_data'
+    bludot_data_dir = results_path / 'bludot_data'
+    output_dir      = results_path / 'output'
+    final_result    = output_dir / 'final_result'
+    final_output    = output_dir / 'final_output'
+
+    for d in [output_dir, final_result, final_output]:
+        d.mkdir(parents=True, exist_ok=True)
 
     city_name = city.name
 
-    # Load mappings from DB
-    biz_map     = _load_column_mappings(db, city.id)
-    contact_map = _load_contact_mappings(db, city.id)
-    custom_map  = _load_custom_mappings(db, city.id)
+    # ── Load city and bludot records from disk (de_duplication_merged) ────────
+    dedup_merged_path = city_data_dir / 'de_duplication_merged.xlsx'
+    bludot_concat_path = bludot_data_dir / 'bludot_concatenated_records.xlsx'
 
-    # Load the intermediate match result files
-    matched_path = final_result_dir / f'final_matched_records_for_{city_name}.xlsx'
-    additional_path = final_result_dir / f'additional_city_records_for_{city_name}.xlsx'
-    bludot_path  = output_dir / 'bludot_data' / 'bludot_concatenated_records.xlsx'
+    if not dedup_merged_path.exists():
+        logger.warning(f"step5: {dedup_merged_path} not found — trying manual_dedup_records.xlsx")
+        dedup_merged_path = city_data_dir / 'manual_dedup_records.xlsx'
 
-    def load_records(path: Path) -> list[dict]:
-        if not path.exists():
-            return []
-        df = pd.read_excel(str(path), dtype=object).fillna('')
-        return df.to_dict('records')
+    city_df   = pd.read_excel(str(dedup_merged_path))   if dedup_merged_path.exists()  else pd.DataFrame()
+    bludot_df = pd.read_excel(str(bludot_concat_path))  if bludot_concat_path.exists() else pd.DataFrame()
 
-    matched_records    = load_records(matched_path)
-    additional_records = load_records(additional_path)
-    bludot_records     = load_records(bludot_path) if bludot_path.exists() else []
+    # Ensure index columns exist
+    if 'city_index' not in city_df.columns and len(city_df):
+        city_df['city_index'] = range(len(city_df))
+    if 'bludot_index' not in bludot_df.columns and len(bludot_df):
+        bludot_df['bludot_index'] = range(len(bludot_df))
 
-    # ── Build sheets ──────────────────────────────────────────────────────────
-    biz_matched_df    = _build_business_df(matched_records,    biz_map, city_name, is_additional=False)
-    biz_additional_df = _build_business_df(additional_records, biz_map, city_name, is_additional=True)
+    # ── Get all confirmed matches from DB ─────────────────────────────────────
+    matched_rows = _get_all_confirmed_matches(db, city.id)
+    logger.info(f"step5: {len(matched_rows)} confirmed matches found in DB")
 
-    custom_matched_df    = _build_custom_df(matched_records,    custom_map, bludot_records, city_name)
-    custom_additional_df = _build_custom_df(additional_records, custom_map, None, city_name, is_additional=True)
+    if not matched_rows:
+        logger.warning("step5: No matched records found — output will be empty")
+        matched_df  = pd.DataFrame(columns=['city_index', 'bludot_index'])
+        add_city_df = city_df.copy()
+        add_bludot_df = bludot_df.copy()
+    else:
+        matched_df = pd.DataFrame(matched_rows)
 
-    contact_matched_df    = _build_contact_df(matched_records,    contact_map, city_name)
-    contact_additional_df = _build_contact_df(additional_records, contact_map, city_name)
+        # ── Reorder city records to match order of matched pairs ──────────────
+        # (from step4.1 — rearrange by matched index order)
+        if len(city_df):
+            city_index_map   = {v: i for i, v in enumerate(matched_df['city_index'])}
+            matched_city_df  = city_df[city_df['city_index'].isin(matched_df['city_index'].values)].copy()
+            matched_city_df['_sort'] = matched_city_df['city_index'].map(city_index_map)
+            matched_city_df  = matched_city_df.sort_values('_sort').drop('_sort', axis=1).reset_index(drop=True)
+        else:
+            matched_city_df = pd.DataFrame()
 
-    # ── Write output Excel files ──────────────────────────────────────────────
-    main_excel = final_output_dir / f'{city_name}_Business_Matched_Records.xlsx'
-    with pd.ExcelWriter(str(main_excel), engine='openpyxl') as writer:
-        biz_matched_df.to_excel(writer, sheet_name='Business_Matched_Records', index=False)
-        if not custom_matched_df.empty:
-            custom_matched_df.to_excel(writer, sheet_name='Custom_Matched_Records', index=False)
-        if not contact_matched_df.empty:
-            contact_matched_df.to_excel(writer, sheet_name='Contact_Matched_Records', index=False)
+        if len(bludot_df):
+            bludot_index_map  = {v: i for i, v in enumerate(matched_df['bludot_index'])}
+            matched_bludot_df = bludot_df[bludot_df['bludot_index'].isin(matched_df['bludot_index'].values)].copy()
+            matched_bludot_df['_sort'] = matched_bludot_df['bludot_index'].map(bludot_index_map)
+            matched_bludot_df = matched_bludot_df.sort_values('_sort').drop('_sort', axis=1).reset_index(drop=True)
+        else:
+            matched_bludot_df = pd.DataFrame()
 
-    add_excel = final_output_dir / f'Additional_Matched_Records_Of_{city_name}.xlsx'
-    with pd.ExcelWriter(str(add_excel), engine='openpyxl') as writer:
-        biz_additional_df.to_excel(writer, sheet_name='Additional_Business_Matched_Rec', index=False)
-        if not custom_additional_df.empty:
-            custom_additional_df.to_excel(writer, sheet_name='Additional_Custom_Matched_Rec', index=False)
-        if not contact_additional_df.empty:
-            contact_additional_df.to_excel(writer, sheet_name='Additional_Contact_Matched_Rec', index=False)
+        # ── Write matched city + bludot side by side ──────────────────────────
+        # (from step4.1 — merged_fuzzy_matched_city_bludot_records equivalent)
+        if len(matched_city_df) and len(matched_bludot_df):
+            combined = pd.concat([matched_city_df, matched_bludot_df], axis=1)
 
-    return {
-        'matched_records':    len(matched_records),
-        'additional_records': len(additional_records),
-        'contact_rows':       len(contact_matched_df),
-        'custom_fields':      len(custom_map),
-        'output_file':        str(main_excel),
+            # Add UUID, city name, bludot name, city address, bludot address as first cols
+            front_cols = pd.DataFrame({
+                'UUID'          : matched_df['bludot_uuid'].values,
+                f'{city_name} Name'    : matched_df['city_name'].values,
+                'Bludot Name'   : matched_df['bludot_name'].values,
+                f'{city_name} Address' : matched_df['city_address'].values,
+                'Bludot Address': matched_df['bludot_address'].values,
+                'Match Pass'    : matched_df['match_pass'].values,
+                'Decision'      : matched_df['final_decision'].values,
+                'LLM Reason'    : matched_df['llm_reason'].values,
+            })
+
+            final_sheet = pd.concat([front_cols, combined], axis=1)
+            final_sheet.to_excel(
+                str(final_output / f'{city_name}_Business_Matched_Records.xlsx'),
+                index=False, sheet_name='Matched_Records'
+            )
+            logger.info(f"step5: Wrote {len(final_sheet)} matched records → {city_name}_Business_Matched_Records.xlsx")
+        else:
+            matched_df.to_excel(
+                str(final_output / f'{city_name}_Business_Matched_Records.xlsx'),
+                index=False
+            )
+
+        # ── Separate additional (unmatched) records ───────────────────────────
+        # (from step4_final_matched_sheet.py — separate_main_spreadsheet)
+        add_city_df, add_bludot_df = _separate_main_spreadsheet(matched_df, city_df, bludot_df)
+
+    # ── Write additional records ──────────────────────────────────────────────
+    add_city_df.to_excel(
+        str(final_result / f'additional_city_records_for_{city_name}.xlsx'),
+        index=False, sheet_name='Additional_City_Records'
+    )
+    add_bludot_df.to_excel(
+        str(final_result / f'additional_bludot_records_for_{city_name}.xlsx'),
+        index=False, sheet_name='Additional_Bludot_Records'
+    )
+
+    # ── Write additional matched records file ─────────────────────────────────
+    # (from step4.1 — Additional_Matched_Records equivalent)
+    if len(matched_rows):
+        matched_df.to_excel(
+            str(final_output / f'Additional_Matched_Records_Of_{city_name}.xlsx'),
+            index=False, sheet_name='All_Matches'
+        )
+
+    # ── Update city output_file_path in DB ────────────────────────────────────
+    city.output_file_path = str(final_output / f'{city_name}_Business_Matched_Records.xlsx')
+    db.commit()
+
+    stats = {
+        'matched_records'     : len(matched_rows),
+        'additional_city'     : len(add_city_df),
+        'additional_bludot'   : len(add_bludot_df) if len(bludot_df) else 0,
+        'additional_records'  : len(add_city_df),
+        'contact_rows'        : 0,
+        'custom_fields'       : 0,
+        'output_file'         : str(final_output / f'{city_name}_Business_Matched_Records.xlsx'),
     }
+    logger.info(f"step5: Done — {stats}")
+    return stats

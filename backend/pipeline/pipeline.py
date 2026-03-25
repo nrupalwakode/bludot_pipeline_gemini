@@ -31,11 +31,6 @@ from ..core.step0_dedup import run_step0
 from ..core.step1_format import run_step1
 from ..core.matching_orchestrator import generate_candidates, run_llm_judge, get_review_queue
 from ..core.step5_6_output import run_step5_and_step6
-from ..services.export_service import (
-    export_matched_records_to_excel,
-    export_additional_city_records,
-    export_additional_bludot_records,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -206,11 +201,8 @@ def _continue_after_dedup(city, city_id, results_dir, db, run):
 def _post_review(city, city_id, results_dir, db, run):
     """Steps 4 → 4.1 → optional gate → 5+6."""
 
-    # Step 4: export split Excel files
+    # Step 4: Split records (logged — actual files written in step5)
     _log_step(db, run, "step4_split", "running", "Splitting matched/additional records…")
-    export_matched_records_to_excel(db, city_id)
-    export_additional_city_records(db, city_id)
-    export_additional_bludot_records(db, city_id)
     _log_step(db, run, "step4_split", "completed", "Records split")
 
     # Step 4.1: second-pass matching
