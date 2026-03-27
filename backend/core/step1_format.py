@@ -1,26 +1,31 @@
 """
 Step 1 — Reformat Columns + Merge
 ==================================
-Replaces: step1.2_city_de_duplication.py + step1.3_deduplication_merge.py
+Adapted from: step1.2_city_de_duplication.py + step1.3_deduplication_merge.py
 
-Two sub-steps:
-  1a. Pivot wide format — one row per cluster, numbered columns merged
-      (Business Name_1, Business Name_2 → longest non-empty value)
-  1b. merge_columns() — phone dedup, address/zip/website consolidation
+This step is SEPARATE from Step 0 and Step 2.
 
-Output: results/city_data/de_duplication_merged.xlsx  (same name as old pipeline)
+Sub-steps:
+  1a. Pivot clusters — keep one representative row per cluster id
+      (row with fewest NaN = most complete data)
+  1b. merge_columns() — merge numbered columns per step1.3 rules:
+      - Business Name_1/_2/_3 → pick LONGEST non-empty value
+      - Address1/2, City, State, Zipcode, Website → first non-empty
+      - Phonenumber → deduplicate unique numbers, join with ", "
+
+Input:  results/city_data/manual_dedup_records.xlsx
+Output: results/city_data/de_duplication_merged.xlsx
 """
 
 import re
 import logging
 import pandas as pd
 from pathlib import Path
-from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
 
-# ── Phone helpers (from step1.3) ──────────────────────────────────────────────
+# ── Phone helpers (from step1.3_deduplication_merge.py) ──────────────────────
 
 def _normalize_phone(phone) -> str | None:
     if pd.isna(phone) or str(phone).strip() == '':
@@ -41,7 +46,7 @@ def _norm_col(name: str) -> str:
     return re.sub(r'\s+', '', str(name).lower())
 
 
-def _extract_field_and_number(col_name: str) -> tuple[str | None, int | None]:
+def _extract_field_and_number(col_name: str):
     m = re.match(r'^(.+?)_(\d+)$', col_name)
     if m:
         return m.group(1), int(m.group(2))
@@ -52,7 +57,7 @@ def _find_column_groups(df: pd.DataFrame, field_variations: dict) -> dict:
     groups = {f: [] for f in field_variations}
     for col in df.columns:
         base, num = _extract_field_and_number(col)
-        if base and num:
+        if base and num is not None:
             nb = _norm_col(base)
             for ftype, variants in field_variations.items():
                 if nb in variants:
@@ -63,14 +68,14 @@ def _find_column_groups(df: pd.DataFrame, field_variations: dict) -> dict:
     return groups
 
 
-# ── Core merge logic (from step1.3) ──────────────────────────────────────────
+# ── Core merge logic (from step1.3_deduplication_merge.py) ───────────────────
 
 def merge_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Merge numbered columns per the original step1.3 rules:
-      Business Name → longest non-empty value across _1, _2, _3 …
+    Merge numbered columns per step1.3 rules:
+      Business Name → longest non-empty across _1, _2, _3 ...
       Address1/2, City, State, Zipcode, Website → first non-empty
-      Phonenumber → unique deduplicated numbers joined with ", "
+      Phonenumber → unique deduplicated, joined with ", "
     """
     field_variations = {
         'business_name': [_norm_col('Business Name')],
@@ -117,7 +122,7 @@ def merge_columns(df: pd.DataFrame) -> pd.DataFrame:
         if phone_cols:
             unique_phones, norm_phones = [], []
             for col, _ in phone_cols:
-                v = df.at[idx, col]
+                v    = df.at[idx, col]
                 norm = _normalize_phone(v)
                 if norm:
                     is_dup = any(_is_phone_duplicate(norm, ep) for ep in norm_phones)
@@ -129,29 +134,19 @@ def merge_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── Pivot / reformat step ─────────────────────────────────────────────────────
+# ── Pivot clusters ────────────────────────────────────────────────────────────
 
 def _pivot_clusters(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    The dedup output has one row per record with a 'cluster id' column.
-    Keep one representative row per cluster (the one with the most data),
-    then rename columns to _1 suffix so merge_columns() can process them.
-
-    If the df already has _1 columns (already pivoted), skip pivoting.
-    """
+    """Keep one representative row per cluster id (fewest NaN values = most data)."""
     if 'cluster id' not in df.columns:
+        logger.info("Step 1: No 'cluster id' column — skipping pivot")
         return df
 
-    # If already in wide format with numbered columns, skip pivot
-    has_numbered = any(re.match(r'.+_\d+$', str(c)) for c in df.columns)
-    if has_numbered:
-        return df
-
-    # Group by cluster — keep row with fewest NaN (most data)
     def _pick_best(group):
         return group.loc[group.isnull().sum(axis=1).idxmin()]
 
     merged = df.groupby('cluster id', sort=False).apply(_pick_best).reset_index(drop=True)
+    logger.info(f"Step 1: Pivot {len(df)} → {len(merged)} rows ({len(df) - len(merged)} duplicates removed)")
     return merged
 
 
@@ -159,14 +154,12 @@ def _pivot_clusters(df: pd.DataFrame) -> pd.DataFrame:
 
 def run_step1(results_dir: str) -> dict:
     """
-    Entry point called by pipeline.py
+    Entry point called by pipeline._step1.
 
     Reads:  results/city_data/manual_dedup_records.xlsx
     Writes: results/city_data/de_duplication_merged.xlsx
-
-    Returns stats dict: {input_records, output_records}
     """
-    results_path = Path(results_dir)
+    results_path  = Path(results_dir)
     city_data_dir = results_path / 'city_data'
     city_data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -174,31 +167,29 @@ def run_step1(results_dir: str) -> dict:
     output_file = city_data_dir / 'de_duplication_merged.xlsx'
 
     if not input_file.exists():
-        logger.warning(f"step1: {input_file} not found — skipping")
-        return {'input_records': 0, 'output_records': 0}
+        raise FileNotFoundError(f"Step 1: Input file not found: {input_file}")
 
-    logger.info(f"step1: Reading {input_file}")
+    logger.info(f"Step 1: Reading {input_file}")
     df = pd.read_excel(str(input_file))
     input_count = len(df)
-    logger.info(f"step1: {input_count} rows, {len(df.columns)} columns")
+    logger.info(f"Step 1: {input_count} rows, {len(df.columns)} columns")
 
-    # 1a. Pivot clusters → one row per cluster
+    # 1a. Pivot to one row per cluster
     df = _pivot_clusters(df)
-    logger.info(f"step1: After pivot: {len(df)} rows")
 
-    # 1b. Fill NaN, infer objects (suppress FutureWarning)
+    # 1b. Fill NaN cleanly
     pd.set_option('future.no_silent_downcasting', True)
     df = df.fillna('').infer_objects(copy=False)
 
     # 1c. Merge numbered columns
     df = merge_columns(df)
-    logger.info(f"step1: After merge: {len(df)} rows")
+    logger.info(f"Step 1: After merge: {len(df)} rows")
 
-    # 1d. Add city_index if missing (needed by matching step)
+    # 1d. Ensure city_index exists
     if 'city_index' not in df.columns:
         df['city_index'] = range(len(df))
 
     df.to_excel(str(output_file), index=False, sheet_name='De_Duplication_Merged')
-    logger.info(f"step1: Saved → {output_file}")
+    logger.info(f"Step 1: Saved → {output_file}")
 
     return {'input_records': input_count, 'output_records': len(df)}

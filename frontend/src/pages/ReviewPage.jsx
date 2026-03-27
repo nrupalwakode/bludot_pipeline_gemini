@@ -45,9 +45,9 @@ export default function ReviewPage() {
         setCityName(cityData.name);
 
         const currentStep = statusData.current_step || "";
-        const isDedup = currentStep === "step0_dedup_review";
+        const isDedup = currentStep === "gate0_cluster_review";
         // Detect pass from pipeline step if not in URL
-        const passFromStep = currentStep === "step4_1_review" ? 2 : 1;
+        const passFromStep = currentStep === "gate4_match_review_pass2" ? 2 : 1;
         const effectivePass = parseInt(searchParams.get("pass") || String(passFromStep));
         setActivePass(effectivePass);
 

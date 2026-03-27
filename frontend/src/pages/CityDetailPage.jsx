@@ -4,16 +4,21 @@ import { API } from "../hooks/useApi";
 import { StatusBadge } from "./CitiesPage";
 
 const STEPS = [
-  { key: "step0_dedup",         label: "Deduplication (LSH)" },
-  { key: "step1_2_format",      label: "Reformat Columns" },
-  { key: "step1_3_merge",       label: "Merge & Sort" },
-  { key: "step2_match",         label: "Match Candidates + LLM" },
-  { key: "step2_review",        label: "Human Review (Pass 1)" },
-  { key: "step4_split",         label: "Split Records" },
-  { key: "step4_1_extra_match", label: "Second-Pass Match + LLM" },
-  { key: "step4_1_review",      label: "Human Review (Pass 2)" },
-  { key: "step5_final_sheets",  label: "Generate Final Sheets" },
-  { key: "step6_contacts",      label: "Generate Contacts" },
+  { key: "step0_dedup",              label: "Deduplication (LSH + LLM)" },
+  { key: "gate0_cluster_review",     label: "Cluster Review" },
+  { key: "step1_format",             label: "Reformat + Merge Columns" },
+  { key: "gate1_verify_step1",       label: "Verify Step 1 Output" },
+  { key: "step2_match",              label: "Match Candidates + LLM (Pass 1)" },
+  { key: "gate2_match_review_pass1", label: "Human Review (Pass 1)" },
+  { key: "step3_split",              label: "Split Records" },
+  { key: "gate3_verify_split",       label: "Verify Split Files" },
+  { key: "step4_match_pass2",        label: "Second-Pass Match + LLM (Pass 2)" },
+  { key: "gate4_match_review_pass2", label: "Human Review (Pass 2)" },
+  { key: "step5_output",             label: "Generate Output Sheets (Step 5)" },
+  { key: "gate5_verify_step5",       label: "Verify Step 5 Output" },
+  { key: "step6_contacts",           label: "Contacts Dedup (Step 6)" },
+  { key: "gate6_verify_contacts",    label: "Verify Contacts" },
+  { key: "done",                     label: "Complete" },
   { key: "done",                label: "Complete" },
 ];
 
@@ -87,11 +92,36 @@ export default function CityDetailPage() {
   stepLogs.forEach(l => { logMap[l.step] = l; });
 
   const pendingReview = status?.step_logs?.find(
-    l => l.step?.includes("review") && l.status === "paused"
+    l => l.status === "paused" && l.stats?.pending_review > 0
   )?.stats?.pending_review || 0;
 
-  const isDedup = status?.current_step === "step0_dedup_review";
-  const reviewPath = isDedup ? `/city/${cityId}/cluster-review` : `/city/${cityId}/review`;
+  // Map each paused gate to its UI action
+  const GATE_CONFIG = {
+    "gate0_cluster_review":     { label: "Cluster Review",        path: `/city/${cityId}/cluster-review`, needsReview: true },
+    "gate1_verify_step1":       { label: "Verify Step 1 File",    path: null,                             needsReview: false },
+    "gate2_match_review_pass1": { label: "Review Queue (Pass 1)", path: `/city/${cityId}/review`,         needsReview: true },
+    "gate3_verify_split":       { label: "Verify Split Files",    path: null,                             needsReview: false },
+    "gate4_match_review_pass2": { label: "Review Queue (Pass 2)", path: `/city/${cityId}/review?pass=2`,  needsReview: true },
+    "gate5_verify_step5":       { label: "Verify Step 5 Output",  path: null,                             needsReview: false },
+    "gate6_verify_contacts":    { label: "Verify Contacts",       path: null,                             needsReview: false },
+  };
+
+  const currentGate   = GATE_CONFIG[currentStep] || null;
+  const gateLabel     = currentGate?.label || "Review Queue";
+  const gatePath      = currentGate?.path || null;
+  const gateNeedsUI   = currentGate?.needsReview && pendingReview > 0;
+
+  // Paused message per gate
+  const GATE_MESSAGES = {
+    "gate0_cluster_review":     `${pendingReview} uncertain dedup pairs need cluster review.`,
+    "gate1_verify_step1":       "Verify de_duplication_merged.xlsx — check Business Name, phones, addresses.",
+    "gate2_match_review_pass1": `${pendingReview} pairs need human review (pass 1).`,
+    "gate3_verify_split":       "Verify split files. Check final_matched_records and additional files. Add manual matches to city_bludot_index.xlsx if needed.",
+    "gate4_match_review_pass2": `${pendingReview} pairs need human review (pass 2).`,
+    "gate5_verify_step5":       "Verify Business_Matched_Records.xlsx — check Business, Custom, Contact sheets.",
+    "gate6_verify_contacts":    "Verify Contact_Matched_Records sheet in the final Excel.",
+  };
+  const pauseMessage = GATE_MESSAGES[currentStep] || "Review required before continuing.";
 
   return (
     <div>
@@ -112,6 +142,36 @@ export default function CityDetailPage() {
         </div>
 
         <div style={{ display: "flex", gap: 10 }}>
+          {pipelineStatus === "not_started" && (
+            <button className="btn btn-primary" onClick={handleStart}>▶ Start Pipeline</button>
+          )}
+          {pipelineStatus === "paused" && (
+            <>
+              {gatePath && gateNeedsUI && (
+                <Link to={gatePath} className="btn" style={{
+                  background: "rgba(245,158,11,0.15)", color: "var(--warn)",
+                  border: "1px solid rgba(245,158,11,0.3)"
+                }}>
+                  ⚑ {gateLabel} ({pendingReview})
+                </Link>
+              )}
+              {gatePath && !gateNeedsUI && (
+                <Link to={gatePath} className="btn" style={{
+                  background: "rgba(245,158,11,0.15)", color: "var(--warn)",
+                  border: "1px solid rgba(245,158,11,0.3)"
+                }}>
+                  ⚑ {gateLabel}
+                </Link>
+              )}
+              <button className="btn btn-primary" onClick={handleResume}
+                disabled={resuming || (gateNeedsUI && pendingReview > 0)}>
+                {resuming ? <><span className="spinner" /> Resuming…</> : "▶ Resume"}
+              </button>
+            </>
+          )}
+          {pipelineStatus === "failed" && (
+            <button className="btn btn-primary" onClick={handleStart}>↺ Retry</button>
+          )}
           {pipelineStatus === "completed" && (
             <Link to={`/city/${cityId}/matches`} className="btn btn-primary">
               ✓ View Matches
@@ -122,42 +182,29 @@ export default function CityDetailPage() {
               ⊞ Dedup Results
             </Link>
           )}
-          {pipelineStatus === "not_started" && (
-            <button className="btn btn-primary" onClick={handleStart}>▶ Start Pipeline</button>
-          )}
-          {pipelineStatus === "paused" && (
-            <>
-              <Link to={reviewPath} className="btn" style={{
-                background: "rgba(245,158,11,0.15)", color: "var(--warn)",
-                border: "1px solid rgba(245,158,11,0.3)"
-              }}>
-                ⚑ {isDedup ? "Cluster Review" : "Review Queue"} ({pendingReview})
-              </Link>
-              <button className="btn btn-primary" onClick={handleResume} disabled={resuming || pendingReview > 0}>
-                {resuming ? <><span className="spinner" /> Resuming…</> : "▶ Resume"}
-              </button>
-            </>
-          )}
-          {pipelineStatus === "failed" && (
-            <button className="btn btn-primary" onClick={handleStart}>↺ Retry</button>
-          )}
         </div>
       </div>
 
       {error && <div className="alert alert-error" style={{ marginBottom: 20 }}>{error}</div>}
 
-      {pipelineStatus === "paused" && pendingReview > 0 && (
+      {pipelineStatus === "paused" && gateNeedsUI && (
         <div className="alert alert-warn" style={{ marginBottom: 20 }}>
-          ⏸ Pipeline is paused — <strong>{pendingReview} record pairs</strong> need human review before continuing.
-          <Link to={reviewPath} style={{ color: "var(--warn)", marginLeft: 8, fontWeight: 600 }}>
-            Open {isDedup ? "Cluster Review" : "Review Queue"} →
-          </Link>
+          ⏸ Pipeline paused — <strong>{pendingReview} pairs</strong> need review.{" "}
+          {gatePath && (
+            <Link to={gatePath} style={{ color: "var(--warn)", fontWeight: 600 }}>
+              Open {gateLabel} →
+            </Link>
+          )}
         </div>
       )}
 
-      {pipelineStatus === "paused" && pendingReview === 0 && (
-        <div className="alert alert-success" style={{ marginBottom: 20 }}>
-          ✅ All items reviewed. Click <strong>Resume</strong> to continue the pipeline.
+      {pipelineStatus === "paused" && !gateNeedsUI && (
+        <div className="alert alert-warn" style={{ marginBottom: 20 }}>
+          ⏸ Pipeline paused at <strong>{gateLabel}</strong> — {pauseMessage}
+          {gatePath && (
+            <>{" "}<Link to={gatePath} style={{ color: "var(--warn)", fontWeight: 600 }}>Open →</Link></>
+          )}
+          {" "}<strong>Click Resume to continue after verifying.</strong>
         </div>
       )}
 
