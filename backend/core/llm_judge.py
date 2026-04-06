@@ -34,7 +34,7 @@ def _get_client() -> Groq:
         api_key = os.getenv("GROQ_API_KEY", "")
         if not api_key:
             raise RuntimeError("No GROQ_API_KEY configured")
-        _client = Groq(api_key=api_key)
+        _client = Groq(api_key=api_key, timeout=60.0)
     return _client
 
 def has_api_key() -> bool:
@@ -43,7 +43,7 @@ def has_api_key() -> bool:
 
 # ── Core Groq call ────────────────────────────────────────────────────────────
 
-def _call_llm(prompt: str, max_tokens: int = 1024, retries: int = 3) -> dict | list:
+def _call_llm(prompt: str, max_tokens: int = 1024, retries: int = 5) -> dict | list:
     """Call Groq with retry on rate limit. Returns parsed JSON."""
     last_error = None
 
@@ -87,10 +87,15 @@ def _call_llm(prompt: str, max_tokens: int = 1024, retries: int = 3) -> dict | l
             elif "quota" in err_str.lower() or "limit" in err_str.lower():
                 logger.warning("Groq quota exhausted — marking as UNCERTAIN")
                 return {"decision": "UNCERTAIN", "reason": "Quota exhausted"}
+            elif "connection" in err_str.lower() or "timeout" in err_str.lower() or "connect" in err_str.lower():
+                wait = 2 ** attempt * 5
+                logger.warning(f"Groq connection error (attempt {attempt+1}), retrying in {wait}s: {e}")
+                time.sleep(wait)
             else:
                 logger.error(f"Groq call failed: {e}")
                 break
 
+    logger.error(f"All Groq retries exhausted — marking as UNCERTAIN. Last error: {last_error}")
     return {"decision": "UNCERTAIN", "reason": f"LLM error: {last_error}"}
 
 

@@ -11,13 +11,16 @@ services:
     environment:
       - DATABASE_URL=sqlite:////app/backend/bludot_pipeline.db
       - GROQ_API_KEY=${GROQ_API_KEY}
-    user: "${UID:-1000}:${GID:-1000}"
+    init: true  # This handles the cleanup signals correctly
+    # TEMPORARILY comment out the 'user' line to ensure permissions align
+    # user: "${UID:-1000}:${GID:-1000}" 
     command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    init: true
     ports:
       - "3000:3000"
     volumes:
