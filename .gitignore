@@ -59,4 +59,4 @@ coverage/
 uploads/
 backend/uploads/
 *.xlsx
-*.csv
+*.csv*.deb
