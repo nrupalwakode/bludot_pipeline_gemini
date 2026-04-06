@@ -23,6 +23,9 @@ const CONTACT_TYPES = ["email", "phone_number", "address"];
 const TYPE_OPTIONS  = ["office", "home", "mobile", "direct", "fax", "others"];
 const CONTACT_ROLES = ["Owner", "Manager", "Agent", "Contact", "Other"];
 
+// NEW: Fixed list of Titles you can select!
+const CONTACT_TITLES = ["— No Title —", "Owner", "CEO", "President", "Director", "Manager", "Agent", "Coordinator", "Other"];
+
 export default function NewCityPage() {
   const navigate = useNavigate();
   const [step, setStep]             = useState(1);
@@ -69,6 +72,7 @@ export default function NewCityPage() {
             role:           s.meta?.role || "Contact",
             personCol:      s.meta?.person_col || "",
             personColParts: s.meta?.person_col_parts || [],
+            titleVal:       "— No Title —",
           });
         } else if (s.mapping_type === "custom") {
           newCustomRows.push({
@@ -120,7 +124,7 @@ export default function NewCityPage() {
       const cRows = [];
       cols.forEach(col => {
         const guess = guessContactField(col);
-        if (guess) cRows.push({ sourceCol: col, ...guess, typeVal: "office", personCol: "", personColParts: [] });
+        if (guess) cRows.push({ sourceCol: col, ...guess, typeVal: "office", personCol: "", personColParts: [], titleVal: "— No Title —" });
       });
       setContactRows(cRows);
 
@@ -173,6 +177,8 @@ export default function NewCityPage() {
             type:             row.typeVal || "office",
             person_col:       (row.personColParts?.length > 0) ? "" : (row.personCol || ""),
             person_col_parts: (row.personColParts?.length > 0) ? row.personColParts : [],
+            // FORMAT FIX: Wrapping the title in brackets tells the Python backend it's a hardcoded string, not a column name!
+            title_col:        (row.titleVal && row.titleVal !== "— No Title —") ? `[${row.titleVal}]` : "", 
           },
         });
       });
@@ -383,7 +389,10 @@ function BusinessTab({ detectedCols, businessMap, setBusinessMap }) {
 // ── Contact Fields Tab ────────────────────────────────────────────────────────
 function ContactTab({ detectedCols, contactRows, setContactRows }) {
   function addRow() {
-    setContactRows([...contactRows, { sourceCol: detectedCols[0] || "", role: "Owner", contactType: "email", typeVal: "office", personCol: "", personColParts: [] }]);
+    setContactRows([...contactRows, { 
+      sourceCol: detectedCols[0] || "", role: "Owner", contactType: "email", 
+      typeVal: "office", personCol: "", personColParts: [], titleVal: "— No Title —" 
+    }]);
   }
   
   function updateMulti(i, updates) {
@@ -401,7 +410,7 @@ function ContactTab({ detectedCols, contactRows, setContactRows }) {
   return (
     <div>
       <p className="text-muted" style={{ fontSize: 13, marginBottom: 16 }}>
-        Map columns containing contact info (emails, phones). Link the person's name using the checkboxes.
+        Map columns containing contact info (emails, phones). Link the person's name and title.
       </p>
 
       {contactRows.length === 0 ? (
@@ -413,14 +422,16 @@ function ContactTab({ detectedCols, contactRows, setContactRows }) {
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 16 }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 1fr 1.5fr 28px", gap: 8 }}>
-            {["Value Column", "Contact Type", "Type", "Role", "Person Name Column(s)", ""].map(h => (
+          {/* Header */}
+          <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.9fr 0.9fr 0.9fr 1fr 1.5fr 28px", gap: 8 }}>
+            {["Value Column", "Contact", "Type", "Role", "Title", "Name Column(s)", ""].map(h => (
               <span key={h} style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase" }}>{h}</span>
             ))}
           </div>
+          
           {contactRows.map((row, i) => (
             <div key={i} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 1fr 1.5fr 28px", gap: 8, alignItems: "start" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.9fr 0.9fr 0.9fr 1fr 1.5fr 28px", gap: 8, alignItems: "start" }}>
                 
                 <select value={row.sourceCol} onChange={e => update(i, "sourceCol", e.target.value)}>
                   {detectedCols.map(c => <option key={c} value={c}>{c}</option>)}
@@ -436,6 +447,11 @@ function ContactTab({ detectedCols, contactRows, setContactRows }) {
                 
                 <select value={row.role} onChange={e => update(i, "role", e.target.value)}>
                   {CONTACT_ROLES.map(r => <option key={r} value={r}>{r}</option>)}
+                </select>
+
+                {/* STATIC TITLE DROPDOWN! */}
+                <select value={row.titleVal || "— No Title —"} onChange={e => update(i, "titleVal", e.target.value)}>
+                  {CONTACT_TITLES.map(t => <option key={t} value={t}>{t}</option>)}
                 </select>
                 
                 {/* Person name — single col or multi-select checkboxes */}
@@ -457,7 +473,6 @@ function ContactTab({ detectedCols, contactRows, setContactRows }) {
                     Or check multiple to concatenate:
                   </div>
                   
-                  {/* UX FIX: Checkboxes with word-wrapping */}
                   <div style={{ 
                     maxHeight: 140, overflowY: "auto", border: "1px solid var(--border2)", 
                     borderRadius: 4, padding: "6px 8px", background: "var(--surface)", 
@@ -512,7 +527,6 @@ function ContactTab({ detectedCols, contactRows, setContactRows }) {
 
 // ── Custom Fields Tab ─────────────────────────────────────────────────────────
 function CustomTab({ detectedCols, customRows, setCustomRows, businessMap, contactRows }) {
-  // UX FIX: Now checks personCol and personColParts so names don't show as "unmapped"
   const taken = new Set([
     ...Object.entries(businessMap).filter(([,v]) => v !== "SKIP").map(([k]) => k),
     ...contactRows.map(r => r.sourceCol),
