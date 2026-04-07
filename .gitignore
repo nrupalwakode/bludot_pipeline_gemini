@@ -60,3 +60,7 @@ uploads/
 backend/uploads/
 *.xlsx
 *.csv*.deb
+*.deb
+*.log
+syslog*
+.docker/
