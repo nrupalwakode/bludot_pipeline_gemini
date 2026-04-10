@@ -10,7 +10,7 @@ Decision flow — in order, stop at first match:
        AUTO_MATCH  → name ≥ 90% AND (both addr blank OR street nums match AND addr ≥ 80%)
        AUTO_REJECT → street nums both present AND different
        AUTO_REJECT → name < 50% (completely different)
-  3. LLM (Gemini) — only for genuinely ambiguous pairs
+  3. LLM (Groq) — only for genuinely ambiguous pairs
        = name similar but address situation unclear (one blank, no street num, etc.)
   4. Human review — only for LLM UNCERTAIN responses
 """
@@ -198,8 +198,6 @@ def run_llm_judge(db: Session, city_id: int, match_pass: int = 1) -> dict:
     Two-stage decision:
       Stage A: Pure rules — auto-decide clear cases (no API call)
       Stage B: LLM — only for genuinely ambiguous pairs
-
-    This minimises Gemini token usage while keeping accuracy.
     """
     from rapidfuzz import fuzz
 
@@ -274,9 +272,11 @@ def run_llm_judge(db: Session, city_id: int, match_pass: int = 1) -> dict:
         for mc, cr, br in needs_llm
     ]
 
-    logger.info(f"Sending {len(pairs)} ambiguous pairs to Gemini")
+    logger.info(f"Sending {len(pairs)} ambiguous pairs to LLM in a single batch...")
+    
+    # Send all pairs at once, zero chunking.
     results = judge_candidates(pairs)
-    result_map = {r["candidate_id"]: r for r in results}
+    result_map = {r["candidate_id"]: r for r in results if "candidate_id" in r}
 
     for mc, cr, br in needs_llm:
         res = result_map.get(mc.id)

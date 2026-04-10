@@ -1,15 +1,8 @@
 """
-LLM Judge — Groq
-================
-Uses Groq's free API (llama-3.3-70b-versatile) instead of Gemini.
-
-Groq free tier: 14,400 requests/day, 500,000 tokens/day — much more generous.
-Set GROQ_API_KEY in your .env file.
-
-Handles three use cases:
-  1. Match judging   — single batched API call for ALL pairs at once
-  2. Mapping suggest — suggest column mappings from city sheet columns
-  3. Dedup pair judging — batched call for dedup near-misses
+LLM Judge — Groq (High Accuracy Mode)
+=====================================
+Uses Groq's smart model (llama-3.3-70b-versatile).
+Includes proactive pacing to safely stay under the 6,000 TPM free-tier limit.
 """
 
 import json
@@ -24,32 +17,63 @@ from groq import Groq
 logger = logging.getLogger(__name__)
 
 
-# ── Client setup ──────────────────────────────────────────────────────────────
+# ── Client setup (Round-Robin Multi-Key) ──────────────────────────────────────
 
-_client: Groq | None = None
+_clients: list[Groq] = []
+_current_key_index = 0
+
+def _init_clients():
+    global _clients
+    if _clients:
+        return
+
+    raw_keys = os.getenv("GROQ_API_KEYS", "")
+    keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+
+    if not keys:
+        single_key = os.getenv("GROQ_API_KEY", "").strip()
+        if single_key:
+            keys = [single_key]
+
+    if not keys:
+        logger.warning("No GROQ_API_KEYS or GROQ_API_KEY configured")
+        return
+
+    for k in keys:
+        _clients.append(Groq(api_key=k, timeout=60.0))
 
 def _get_client() -> Groq:
-    global _client
-    if _client is None:
-        api_key = os.getenv("GROQ_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("No GROQ_API_KEY configured")
-        _client = Groq(api_key=api_key, timeout=60.0)
-    return _client
+    global _current_key_index, _clients
+    _init_clients()
+    if not _clients:
+        raise RuntimeError("No Groq API keys configured")
+
+    client = _clients[_current_key_index]
+    _current_key_index = (_current_key_index + 1) % len(_clients)
+    return client
 
 def has_api_key() -> bool:
-    return bool(os.getenv("GROQ_API_KEY", "").strip())
+    _init_clients()
+    return len(_clients) > 0
 
 
 # ── Core Groq call ────────────────────────────────────────────────────────────
 
-def _call_llm(prompt: str, max_tokens: int = 1024, retries: int = 5) -> dict | list:
-    """Call Groq with retry on rate limit. Returns parsed JSON."""
+def _call_llm(prompt: str, max_tokens: int = 1024, retries: int = None) -> dict | list:
+    _init_clients()
+    if not _clients:
+        return {"decision": "UNCERTAIN", "reason": "No API key"}
+
+    if retries is None:
+        retries = len(_clients) * 3 
+
     last_error = None
 
     for attempt in range(retries):
         try:
             client = _get_client()
+
+            # SMARTEST MODEL: llama-3.3-70b-versatile
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
@@ -61,17 +85,16 @@ def _call_llm(prompt: str, max_tokens: int = 1024, retries: int = 5) -> dict | l
 
             if text.startswith("```"):
                 parts = text.split("```")
-                text = parts[1]
-                if text.startswith("json"):
-                    text = text[4:]
+                if len(parts) > 1:
+                    text = parts[1]
+                    if text.startswith("json"):
+                        text = text[4:]
             text = text.strip()
 
             return json.loads(text)
 
         except json.JSONDecodeError as e:
             last_error = e
-            raw = locals().get("text", "")[:400]
-            logger.error(f"JSON parse error (attempt {attempt+1}): {e}\nRaw: {raw!r}")
             if attempt == 0:
                 max_tokens = min(max_tokens * 2, 8192)
                 continue
@@ -79,23 +102,22 @@ def _call_llm(prompt: str, max_tokens: int = 1024, retries: int = 5) -> dict | l
 
         except Exception as e:
             last_error = e
-            err_str = str(e)
-            if "rate_limit" in err_str.lower() or "429" in err_str:
-                wait = 2 ** attempt * 5
-                logger.warning(f"Groq rate limit, waiting {wait}s")
-                time.sleep(wait)
-            elif "quota" in err_str.lower() or "limit" in err_str.lower():
-                logger.warning("Groq quota exhausted — marking as UNCERTAIN")
-                return {"decision": "UNCERTAIN", "reason": "Quota exhausted"}
-            elif "connection" in err_str.lower() or "timeout" in err_str.lower() or "connect" in err_str.lower():
-                wait = 2 ** attempt * 5
-                logger.warning(f"Groq connection error (attempt {attempt+1}), retrying in {wait}s: {e}")
-                time.sleep(wait)
+            err_str = str(e).lower()
+
+            if "413" in err_str or "rate_limit" in err_str or "429" in err_str:
+                logger.warning(f"Groq limit hit. Swapping keys & pausing 10s... (Attempt {attempt+1}/{retries})")
+                time.sleep(10)
+                continue
+            elif "quota" in err_str or "limit" in err_str:
+                logger.warning(f"Groq quota exhausted on current key. Swapping...")
+                time.sleep(5)
+                continue
             else:
                 logger.error(f"Groq call failed: {e}")
                 break
 
-    logger.error(f"All Groq retries exhausted — marking as UNCERTAIN. Last error: {last_error}")
+    logger.warning("Forcing 30-second cooldown due to total key exhaustion...")
+    time.sleep(30)
     return {"decision": "UNCERTAIN", "reason": f"LLM error: {last_error}"}
 
 
@@ -122,7 +144,7 @@ Respond with a JSON object containing a "results" array — one object per pair 
   {{"id": 1, "decision": "MATCH", "reason": "one sentence"}},
   {{"id": 2, "decision": "NO_MATCH", "reason": "one sentence"}}
 ]}}
-decision must be exactly: MATCH, NO_MATCH, or UNCERTAIN (= human should review)"""
+decision must be exactly: MATCH, NO_MATCH, or UNCERTAIN"""
 
 BATCH_DEDUP_PROMPT = """You are checking if business records are duplicates.
 
@@ -186,57 +208,63 @@ class CandidatePair:
 
 
 def judge_candidates(pairs: list[CandidatePair]) -> list[dict]:
-    """Send ALL pairs to Groq in ONE API call."""
     if not pairs:
         return []
 
     now = datetime.utcnow().isoformat()
-
     if not has_api_key():
-        return [{"candidate_id": p.candidate_id, "llm_decision": "UNCERTAIN",
-                 "llm_reason": "No API key", "llm_called_at": now}
-                for p in pairs]
+        return [{"candidate_id": p.candidate_id, "llm_decision": "UNCERTAIN", "llm_reason": "No API key", "llm_called_at": now} for p in pairs]
 
-    lines = []
-    for i, p in enumerate(pairs, 1):
-        lines.append(
-            f"{i}. A: \"{p.city_name or '(blank)'}\" / \"{p.city_address or '(blank)'}\"\n"
-            f"   B: \"{p.bludot_name or '(blank)'}\" / \"{p.bludot_address or '(blank)'}\""
-        )
+    # PACED CHUNKING: Tiny chunks to survive the 6000 TPM limit
+    CHUNK_SIZE = 20
+    all_outputs = []
 
-    max_out = min(200 + len(pairs) * 40, 4096)
-    prompt = BATCH_MATCH_PROMPT.format(pairs_block="\n".join(lines))
+    for chunk_idx in range(0, len(pairs), CHUNK_SIZE):
+        chunk = pairs[chunk_idx:chunk_idx + CHUNK_SIZE]
+        
+        lines = []
+        for i, p in enumerate(chunk, 1):
+            # SAFE TRUNCATION: 250 chars gives it plenty of context to make a smart decision
+            c_name = str(p.city_name or '(blank)')[:250].replace("\n", " ")
+            c_addr = str(p.city_address or '(blank)')[:250].replace("\n", " ")
+            b_name = str(p.bludot_name or '(blank)')[:250].replace("\n", " ")
+            b_addr = str(p.bludot_address or '(blank)')[:250].replace("\n", " ")
 
-    logger.info(f"Sending {len(pairs)} pairs to Groq in 1 batched call")
-    result = _call_llm(prompt, max_tokens=max_out)
+            lines.append(f"{i}. A: \"{c_name}\" / \"{c_addr}\"\n   B: \"{b_name}\" / \"{b_addr}\"")
 
-    if isinstance(result, dict) and "results" in result:
-        result_list = result["results"]
-    elif isinstance(result, list):
-        result_list = result
-    else:
-        logger.error(f"Unexpected Groq response: {result}")
-        return [{"candidate_id": p.candidate_id, "llm_decision": "UNCERTAIN",
-                 "llm_reason": "Parse error", "llm_called_at": now}
-                for p in pairs]
+        max_out = min(200 + len(chunk) * 40, 4096)
+        prompt = BATCH_MATCH_PROMPT.format(pairs_block="\n".join(lines))
 
-    result_by_id = {r.get("id"): r for r in result_list if isinstance(r, dict)}
-    output = []
-    for i, p in enumerate(pairs, 1):
-        r = result_by_id.get(i, {})
-        output.append({
-            "candidate_id" : p.candidate_id,
-            "llm_decision" : r.get("decision", "UNCERTAIN"),
-            "llm_reason"   : r.get("reason", ""),
-            "llm_called_at": now,
-        })
-    return output
+        result = _call_llm(prompt, max_tokens=max_out)
+
+        if isinstance(result, dict) and "results" in result:
+            result_list = result["results"]
+        elif isinstance(result, list):
+            result_list = result
+        else:
+            for p in chunk:
+                all_outputs.append({"candidate_id" : p.candidate_id, "llm_decision" : "UNCERTAIN", "llm_reason" : "Parse error", "llm_called_at": now})
+            continue
+
+        result_by_id = {r.get("id"): r for r in result_list if isinstance(r, dict)}
+        for i, p in enumerate(chunk, 1):
+            r = result_by_id.get(i, {})
+            all_outputs.append({
+                "candidate_id" : p.candidate_id,
+                "llm_decision" : r.get("decision", "UNCERTAIN"),
+                "llm_reason"   : r.get("reason", ""),
+                "llm_called_at": now,
+            })
+            
+        # PROACTIVE PACING: Wait 12 seconds between chunks to avoid TPM bans
+        if chunk_idx + CHUNK_SIZE < len(pairs):
+            time.sleep(12)
+            
+    return all_outputs
 
 
 def judge_single_pair(candidate_id, city_name, city_address, bludot_name, bludot_address) -> dict:
-    pair = CandidatePair(candidate_id=candidate_id, city_name=city_name,
-                         city_address=city_address, bludot_name=bludot_name,
-                         bludot_address=bludot_address, rule_reason="")
+    pair = CandidatePair(candidate_id=candidate_id, city_name=city_name, city_address=city_address, bludot_name=bludot_name, bludot_address=bludot_address, rule_reason="")
     results = judge_candidates([pair])
     return results[0] if results else {}
 
@@ -257,76 +285,72 @@ class DedupPair:
 
 
 def judge_dedup_pairs(pairs: list[DedupPair]) -> list[dict]:
-    """Send ALL dedup pairs in ONE API call."""
     if not pairs:
         return []
 
     if not has_api_key():
-        return [{"pair_id": p.pair_id, "index_a": p.index_a, "index_b": p.index_b,
-                 "decision": "UNCERTAIN", "reason": "No API key"}
-                for p in pairs]
+        return [{"pair_id": p.pair_id, "index_a": p.index_a, "index_b": p.index_b, "decision": "UNCERTAIN", "reason": "No API key"} for p in pairs]
 
-    lines = []
-    for i, p in enumerate(pairs, 1):
-        lines.append(
-            f"{i}. A: \"{p.name_a or '(blank)'}\" / \"{p.address_a or '(blank)'}\"\n"
-            f"   B: \"{p.name_b or '(blank)'}\" / \"{p.address_b or '(blank)'}\""
-            f"   (similarity: {p.similarity:.0%})"
-        )
+    CHUNK_SIZE = 10
+    all_outputs = []
 
-    max_out = min(200 + len(pairs) * 40, 4096)
-    prompt = BATCH_DEDUP_PROMPT.format(pairs_block="\n".join(lines))
+    for chunk_idx in range(0, len(pairs), CHUNK_SIZE):
+        chunk = pairs[chunk_idx:chunk_idx + CHUNK_SIZE]
 
-    logger.info(f"Sending {len(pairs)} dedup pairs to Groq in 1 batched call")
-    result = _call_llm(prompt, max_tokens=max_out)
+        lines = []
+        for i, p in enumerate(chunk, 1):
+            n_a = str(p.name_a or '(blank)')[:250].replace("\n", " ")
+            a_a = str(p.address_a or '(blank)')[:250].replace("\n", " ")
+            n_b = str(p.name_b or '(blank)')[:250].replace("\n", " ")
+            a_b = str(p.address_b or '(blank)')[:250].replace("\n", " ")
 
-    if isinstance(result, dict) and "results" in result:
-        result_list = result["results"]
-    elif isinstance(result, list):
-        result_list = result
-    else:
-        return [{"pair_id": p.pair_id, "index_a": p.index_a, "index_b": p.index_b,
-                 "decision": "UNCERTAIN", "reason": "Parse error"}
-                for p in pairs]
+            lines.append(f"{i}. A: \"{n_a}\" / \"{a_a}\"\n   B: \"{n_b}\" / \"{a_b}\"   (similarity: {p.similarity:.0%})")
 
-    result_by_id = {r.get("id"): r for r in result_list if isinstance(r, dict)}
-    output = []
-    for i, p in enumerate(pairs, 1):
-        r = result_by_id.get(i, {})
-        output.append({
-            "pair_id" : p.pair_id,
-            "index_a" : p.index_a,
-            "index_b" : p.index_b,
-            "decision": r.get("decision", "UNCERTAIN"),
-            "reason"  : r.get("reason", ""),
-        })
-    return output
+        max_out = min(200 + len(chunk) * 40, 4096)
+        prompt = BATCH_DEDUP_PROMPT.format(pairs_block="\n".join(lines))
+
+        result = _call_llm(prompt, max_tokens=max_out)
+
+        if isinstance(result, dict) and "results" in result:
+            result_list = result["results"]
+        elif isinstance(result, list):
+            result_list = result
+        else:
+            for p in chunk:
+                all_outputs.append({"pair_id" : p.pair_id, "index_a" : p.index_a, "index_b" : p.index_b, "decision": "UNCERTAIN", "reason": "Parse error"})
+            continue
+
+        result_by_id = {r.get("id"): r for r in result_list if isinstance(r, dict)}
+        for i, p in enumerate(chunk, 1):
+            r = result_by_id.get(i, {})
+            all_outputs.append({
+                "pair_id" : p.pair_id,
+                "index_a" : p.index_a,
+                "index_b" : p.index_b,
+                "decision": r.get("decision", "UNCERTAIN"),
+                "reason"  : r.get("reason", ""),
+            })
+
+        # PROACTIVE PACING
+        if chunk_idx + CHUNK_SIZE < len(pairs):
+            time.sleep(12)
+
+    return all_outputs
 
 
 # ── Column mapping suggestion ─────────────────────────────────────────────────
 
-def suggest_column_mapping(
-    city_columns: list[str],
-    sample_rows: list[dict],
-    bludot_custom_cols: list[str],
-) -> list[dict]:
+def suggest_column_mapping(city_columns: list[str], sample_rows: list[dict], bludot_custom_cols: list[str]) -> list[dict]:
     lines = []
     for col in city_columns:
-        samples = [
-            str(r.get(col, '')) for r in sample_rows
-            if str(r.get(col, '')).strip() not in ('', 'nan', 'None', 'NaT')
-        ][:5]
+        samples = [str(r.get(col, ''))[:100].replace("\n", " ") for r in sample_rows if str(r.get(col, '')).strip() not in ('', 'nan', 'None', 'NaT')][:5]
         sample_str = " | ".join(samples) if samples else "(all empty)"
         lines.append(f"  - {col}: {sample_str}")
 
-    prompt = MAPPING_PROMPT.format(
-        columns_with_samples="\n".join(lines),
-        bludot_custom_cols=", ".join(bludot_custom_cols) if bludot_custom_cols else "(none)",
-    )
+    prompt = MAPPING_PROMPT.format(columns_with_samples="\n".join(lines), bludot_custom_cols=", ".join(bludot_custom_cols) if bludot_custom_cols else "(none)")
 
     if not has_api_key():
-        return [{"source_col": c, "mapping_type": "skip", "target_col": "SKIP", "meta": {}}
-                for c in city_columns]
+        return [{"source_col": c, "mapping_type": "skip", "target_col": "SKIP", "meta": {}} for c in city_columns]
 
     result = _call_llm(prompt, max_tokens=4096)
 
@@ -338,12 +362,10 @@ def suggest_column_mapping(
         result_list = []
 
     for item in result_list:
-        if not isinstance(item.get("meta"), dict):
-            item["meta"] = {}
+        if not isinstance(item.get("meta"), dict): item["meta"] = {}
 
     mapped_cols = {r.get("source_col") for r in result_list}
     for col in city_columns:
         if col not in mapped_cols:
-            result_list.append({"source_col": col, "mapping_type": "skip",
-                                 "target_col": "SKIP", "meta": {}})
+            result_list.append({"source_col": col, "mapping_type": "skip", "target_col": "SKIP", "meta": {}})
     return result_list
