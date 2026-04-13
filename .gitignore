@@ -64,3 +64,4 @@ backend/uploads/
 *.log
 syslog*
 .docker/
+verify/
