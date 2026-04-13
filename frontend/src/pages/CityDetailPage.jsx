@@ -1,3 +1,4 @@
+
 import { useState, useEffect, useCallback } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { API } from "../hooks/useApi";
@@ -20,8 +21,7 @@ const STEPS = [
   { key: "gate5_verify_step5",       label: "Verify Step 5 Output" },
   { key: "step6_contacts",           label: "Contacts Dedup (Step 6)" },
   { key: "gate6_verify_contacts",    label: "Verify Contacts" },
-  { key: "done",                     label: "Complete" },
-  { key: "done",                label: "Complete" },
+  { key: "done",                     label: "Complete" }
 ];
 
 export default function CityDetailPage() {
@@ -52,13 +52,26 @@ export default function CityDetailPage() {
     }
   }, [cityId]);
 
+  // ==========================================
+  // BULLETPROOF POLLING LOGIC
+  // ==========================================
   useEffect(() => {
+    // 1. Always fetch immediately on mount or status change
     fetchAll();
-    // Poll every 4s while running
-    const t = setInterval(() => {
-      if (status?.status === "running") fetchAll();
-    }, 4000);
-    return () => clearInterval(t);
+
+    let intervalId;
+
+    // 2. Only turn the timer on if the pipeline is explicitly running
+    if (status?.status === "running") {
+      intervalId = setInterval(() => {
+        fetchAll();
+      }, 3000); // Poll every 3 seconds for snappy updates
+    }
+
+    // 3. Destroy the timer when status changes (e.g., switches to 'paused')
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
   }, [fetchAll, status?.status]);
 
   async function handleResume() {
@@ -66,6 +79,8 @@ export default function CityDetailPage() {
     setError("");
     try {
       await API.post(`/cities/${cityId}/resume`);
+      // Optimistic update: force frontend into running state to trigger polling instantly
+      setStatus(prev => prev ? { ...prev, status: "running" } : null);
       await fetchAll();
     } catch (e) {
       setError(e.message);
@@ -78,6 +93,8 @@ export default function CityDetailPage() {
     setError("");
     try {
       await API.post(`/cities/${cityId}/start`);
+      // Optimistic update: force frontend into running state to trigger polling instantly
+      setStatus(prev => prev ? { ...prev, status: "running" } : null);
       await fetchAll();
     } catch (e) {
       setError(e.message);
@@ -104,7 +121,7 @@ export default function CityDetailPage() {
     "gate2_match_review_pass1": { label: "Review Queue (Pass 1)", path: `/city/${cityId}/review`,         needsReview: true },
     "gate3_verify_split":       { label: "Verify Split Files",    path: null,                             needsReview: false },
     "gate4_match_review_pass2": { label: "Review Queue (Pass 2)", path: `/city/${cityId}/review?pass=2`,  needsReview: true },
-    "gate4_5_verify_schema":      { label: "Verify City Schema",       path: null,                             needsReview: false },
+    "gate4_5_verify_schema":    { label: "Verify City Schema",    path: null,                             needsReview: false },
     "gate5_verify_step5":       { label: "Verify Step 5 Output",  path: null,                             needsReview: false },
     "gate6_verify_contacts":    { label: "Verify Contacts",       path: null,                             needsReview: false },
   };
