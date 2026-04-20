@@ -86,17 +86,11 @@ def run_step3(city: City, city_id: int, db: Session, results_dir: str) -> dict:
 
     # Matched city + bludot records side by side
     if len(matched_df) and len(city_df) and len(bludot_df):
-        matched_city   = city_df[city_df["city_index"].isin(matched_df["city_index"])]
-        matched_bludot = bludot_df[bludot_df["bludot_index"].isin(matched_df["bludot_index"])]
-        # Reorder to match pair order
-        city_order   = {v: i for i, v in enumerate(matched_df["city_index"])}
-        bludot_order = {v: i for i, v in enumerate(matched_df["bludot_index"])}
-        matched_city   = matched_city.copy()
-        matched_bludot = matched_bludot.copy()
-        matched_city["_sort"]   = matched_city["city_index"].map(city_order)
-        matched_bludot["_sort"] = matched_bludot["bludot_index"].map(bludot_order)
-        matched_city   = matched_city.sort_values("_sort").drop("_sort", axis=1).reset_index(drop=True)
-        matched_bludot = matched_bludot.sort_values("_sort").drop("_sort", axis=1).reset_index(drop=True)
+        # FIXED: Index-Locked Left Join
+        # This perfectly aligns the rows 1:1 and absolutely guarantees they can never shift!
+        matched_city = pd.merge(matched_df[["city_index"]], city_df, on="city_index", how="left")
+        matched_bludot = pd.merge(matched_df[["bludot_index"]], bludot_df, on="bludot_index", how="left")
+        
         final_matched = pd.concat([matched_city, matched_bludot], axis=1)
     else:
         final_matched = pd.DataFrame()

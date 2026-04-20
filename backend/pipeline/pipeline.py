@@ -137,13 +137,14 @@ def resume_city_pipeline(city_id: int):
         try:
             step = run.current_step
             resume_map = {
-                "gate0_cluster_review":       (_step1,  "Step 1 — Reformat"),
-                "gate1_verify_step1":         (_step2,  "Step 2 — Match pass 1"),
-                "gate2_match_review_pass1":   (_step3,  "Step 3 — Split records"),
-                "gate3_verify_split":         (_step4,  "Step 4 — Match pass 2"),
-                "gate4_match_review_pass2":   (_step5,  "Step 5 — Output sheets"),
-                "gate5_verify_step5":         (_step6,  "Step 6 — Contacts"),
-                "gate6_verify_contacts":      (None,    "Pipeline complete"),
+                "gate0_cluster_review":       (_step1,   "Step 1 — Reformat"),
+                "gate1_verify_step1":         (_step2,   "Step 2 — Match pass 1"),
+                "gate2_match_review_pass1":   (_step3,   "Step 3 — Split records"),
+                "gate3_verify_split":         (_step4,   "Step 4 — Match pass 2"),
+                "gate4_match_review_pass2":   (_step4_5, "Step 4.5 — Generate schema"),
+                "gate4_5_verify_schema":      (_step5,   "Step 5 — Output sheets"),
+                "gate5_verify_step5":         (_step6,   "Step 6 — Contacts"),
+                "gate6_verify_contacts":      (None,     "Pipeline complete"),
             }
 
             if step not in resume_map:
@@ -296,14 +297,45 @@ def _step4(city, city_id, results_dir, db, run):
             return
 
         _log_step(db, run, "gate4_match_review_pass2", "completed",
-                  "0 uncertain pass-2 pairs — auto-continuing to Step 5")
+                  "0 uncertain pass-2 pairs — auto-continuing to Step 4.5")
     else:
         _log_step(db, run, "step4_match_pass2", "completed",
                   "No additional candidates found in pass 2", stats={"candidates": 0})
         _log_step(db, run, "gate4_match_review_pass2", "completed",
                   "No pass-2 candidates — skipping gate 4")
 
-    _step5(city, city_id, results_dir, db, run)
+    _step4_5(city, city_id, results_dir, db, run)
+
+
+def _step4_5(city, city_id, results_dir, db, run):
+    """
+    Step 4.5 — Generate city_schema.json using Groq LLM.
+    Maps city columns → Bludot Business Profile + Custom Data fields.
+    If city_schema.json already exists (manually edited), skips LLM.
+    Always pauses for human to verify the schema before Step 5 runs.
+    """
+    from ..core.step4_5_generate_schema import run_step4_5
+    _log_step(db, run, "step4_5_generate_schema", "running",
+              "Step 4.5: Generating city_schema.json (field mapping via Groq)…")
+    stats = run_step4_5(city, db, results_dir)
+
+    msg = ("city_schema.json already exists — using existing schema"
+           if stats.get("schema_exists") else
+           f"city_schema.json generated: "
+           f"{stats.get('mapped_bp', 0)} business fields, "
+           f"{stats.get('mapped_custom', 0)} custom fields, "
+           f"{stats.get('new_fields', 0)} new fields")
+
+    _log_step(db, run, "step4_5_generate_schema", "completed", msg, stats=stats)
+
+    schema_path = str(Path(results_dir).parent / "city_schema.json")
+    _log_step(db, run, "gate4_5_verify_schema", "paused",
+              f"Step 4.5 complete. VERIFY city_schema.json before Step 5. "
+              f"File: {schema_path} — "
+              "Check BUSINESS_MATCHED_CITY_COLUMNS, CUSTOM columns, CONTACT_CONFIG. "
+              "Edit the JSON directly if any mapping is wrong. Resume when verified.",
+              stats={"file": schema_path})
+    _update_run(db, run, "paused", "gate4_5_verify_schema")
 
 
 def _step5(city, city_id, results_dir, db, run):

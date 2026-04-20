@@ -59,4 +59,9 @@ coverage/
 uploads/
 backend/uploads/
 *.xlsx
-*.csv
+*.csv*.deb
+*.deb
+*.log
+syslog*
+.docker/
+verify/

@@ -41,7 +41,10 @@ def date_formatting(df: pd.DataFrame) -> pd.DataFrame:
         if df[col].dropna().shape[0] > 0
         and isinstance(df[col].dropna().iloc[0], (datetime.datetime,))
     ]
-    df = df.fillna('')
+    
+    # FIX: Adding infer_objects(copy=False) to silence the Pandas warning
+    df = df.fillna('').infer_objects(copy=False)
+    
     for col in date_cols:
         df[col] = df[col].apply(
             lambda v: v.strftime("%m/%d/%Y") if not isinstance(v, str) else v
@@ -222,8 +225,12 @@ class BusinessDeduplicator:
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
 
+    # ── Preprocessing ─────────────────────────────────────────────────────────
+
     def preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
+        # FIX: Drop duplicate columns instantly to prevent the "Ambiguous Series" crash
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        
         df['Business Name'] = df['Business Name'].fillna('-').astype(str)
         df['Address1']      = df['Address1'].fillna('-').astype(str)
         df['norm_name']     = df['Business Name'].apply(self._normalize_name)

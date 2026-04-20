@@ -17,11 +17,14 @@ const BUSINESS_FIELDS = [
   { field: "Long",                      required: false },
   { field: "DBA Name",                  required: false },
   { field: "Business Operational Status", required: false },
-  // ID, is_business, business_source → auto-filled
 ];
 
 const CONTACT_TYPES = ["email", "phone_number", "address"];
+const TYPE_OPTIONS  = ["office", "home", "mobile", "direct", "fax", "others"];
 const CONTACT_ROLES = ["Owner", "Manager", "Agent", "Contact", "Other"];
+
+// NEW: Fixed list of Titles you can select!
+const CONTACT_TITLES = ["— No Title —", "Owner", "CEO", "President", "Director", "Manager", "Agent", "Coordinator", "Other"];
 
 export default function NewCityPage() {
   const navigate = useNavigate();
@@ -41,17 +44,9 @@ export default function NewCityPage() {
   const [llmDone, setLlmDone]           = useState(false);
   const [bludotCustomCols, setBludotCustomCols] = useState([]);
 
-  // business: { sourceCol → businessField | "SKIP" }
   const [businessMap, setBusinessMap] = useState({});
-  // contact: [{ sourceCol, role, contactType, personCol }]
   const [contactRows, setContactRows] = useState([]);
-  // custom: [{ sourceCol, targetLabel, bludotCustomCol }]
   const [customRows, setCustomRows]   = useState([]);
-
-  const assignedBusiness = new Set(
-    Object.entries(businessMap).filter(([, v]) => v !== "SKIP").map(([k]) => k)
-  );
-  const assignedContact = new Set(contactRows.map(r => r.sourceCol));
 
   // ── LLM suggest mapping ─────────────────────────────────────────────────────
   async function handleSuggestMapping() {
@@ -71,10 +66,13 @@ export default function NewCityPage() {
           newBizMap[s.source_col] = s.target_col || "SKIP";
         } else if (s.mapping_type === "contact") {
           newContactRows.push({
-            sourceCol:   s.source_col,
-            contactType: s.meta?.contact_type || "email",
-            role:        s.meta?.role || "Contact",
-            personCol:   s.meta?.person_col || "",
+            sourceCol:      s.source_col,
+            contactType:    s.meta?.contact_type || "email",
+            typeVal:        s.meta?.type || "office",
+            role:           s.meta?.role || "Contact",
+            personCol:      s.meta?.person_col || "",
+            personColParts: s.meta?.person_col_parts || [],
+            titleVal:       "— No Title —",
           });
         } else if (s.mapping_type === "custom") {
           newCustomRows.push({
@@ -83,7 +81,6 @@ export default function NewCityPage() {
             bludotCustomCol: s.meta?.bludot_custom_col || "",
           });
         }
-        // skip → leave in businessMap as SKIP
       }
 
       setBusinessMap(newBizMap);
@@ -127,7 +124,7 @@ export default function NewCityPage() {
       const cRows = [];
       cols.forEach(col => {
         const guess = guessContactField(col);
-        if (guess) cRows.push({ sourceCol: col, ...guess, personCol: "" });
+        if (guess) cRows.push({ sourceCol: col, ...guess, typeVal: "office", personCol: "", personColParts: [], titleVal: "— No Title —" });
       });
       setContactRows(cRows);
 
@@ -174,7 +171,15 @@ export default function NewCityPage() {
           source_col  : row.sourceCol,
           target_col  : `[${row.contactType}]`,
           mapping_type: "contact",
-          meta: { role: row.role, contact_type: row.contactType, person_col: row.personCol },
+          meta: {
+            role:             row.role,
+            contact_type:     row.contactType,
+            type:             row.typeVal || "office",
+            person_col:       (row.personColParts?.length > 0) ? "" : (row.personCol || ""),
+            person_col_parts: (row.personColParts?.length > 0) ? row.personColParts : [],
+            // FORMAT FIX: Wrapping the title in brackets tells the Python backend it's a hardcoded string, not a column name!
+            title_col:        (row.titleVal && row.titleVal !== "— No Title —") ? `[${row.titleVal}]` : "", 
+          },
         });
       });
 
@@ -239,17 +244,11 @@ export default function NewCityPage() {
               <label>City Data Sheet (CSV / Excel) *</label>
               <input type="file" accept=".csv,.xlsx,.xls"
                 onChange={e => setRawFile(e.target.files[0])} />
-              <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 5 }}>
-                The input sheet received from the client
-              </p>
             </div>
             <div className="form-group">
               <label>Bludot Export (Excel, multi-sheet) *</label>
               <input type="file" accept=".xlsx,.xls"
                 onChange={e => setBludotFile(e.target.files[0])} />
-              <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 5 }}>
-                The app export (Business Record, Custom Data, Contact_Details sheets)
-              </p>
             </div>
             <button type="submit" className="btn btn-primary" disabled={uploading}>
               {uploading ? <><span className="spinner" /> Uploading…</> : "Upload & Detect Columns →"}
@@ -294,7 +293,7 @@ export default function NewCityPage() {
                 <BusinessTab detectedCols={detectedCols} businessMap={businessMap} setBusinessMap={setBusinessMap} />
               )}
               {activeTab === "contact" && (
-                <ContactTab detectedCols={detectedCols} contactRows={contactRows} setContactRows={setContactRows} businessMap={businessMap} />
+                <ContactTab detectedCols={detectedCols} contactRows={contactRows} setContactRows={setContactRows} />
               )}
               {activeTab === "custom" && (
                 <CustomTab detectedCols={detectedCols} customRows={customRows} setCustomRows={setCustomRows} businessMap={businessMap} contactRows={contactRows} />
@@ -323,7 +322,6 @@ export default function NewCityPage() {
             style={{ padding: "10px 28px", fontSize: 14 }}>
             ▶ Start Pipeline
           </button>
-          {error && <div className="alert alert-error" style={{ marginTop: 16 }}>{error}</div>}
         </div>
       )}
     </div>
@@ -335,8 +333,7 @@ function BusinessTab({ detectedCols, businessMap, setBusinessMap }) {
   return (
     <div>
       <p className="text-muted" style={{ fontSize: 13, marginBottom: 14 }}>
-        Map source columns to the fixed output schema. <strong>ID</strong>, <strong>is_business</strong>,
-        and <strong>business_source</strong> are auto-filled and don't need mapping.
+        Map source columns to the fixed output schema.
       </p>
       {/* Schema pills */}
       <div style={{
@@ -360,12 +357,11 @@ function BusinessTab({ detectedCols, businessMap, setBusinessMap }) {
         })}
       </div>
 
-      {/* Mapping rows */}
       <div style={{ display: "grid", gap: 8 }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 28px 1fr", gap: 10, marginBottom: 2 }}>
-          <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Source Column</span>
+          <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase" }}>Source Column</span>
           <span />
-          <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Maps To (Business Schema)</span>
+          <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase" }}>Maps To</span>
         </div>
         {detectedCols.map(col => (
           <div key={col} style={{ display: "grid", gridTemplateColumns: "1fr 28px 1fr", alignItems: "center", gap: 10 }}>
@@ -391,54 +387,135 @@ function BusinessTab({ detectedCols, businessMap, setBusinessMap }) {
 }
 
 // ── Contact Fields Tab ────────────────────────────────────────────────────────
-function ContactTab({ detectedCols, contactRows, setContactRows, businessMap }) {
+function ContactTab({ detectedCols, contactRows, setContactRows }) {
   function addRow() {
-    setContactRows([...contactRows, { sourceCol: detectedCols[0] || "", role: "Owner", contactType: "email", personCol: "" }]);
+    setContactRows([...contactRows, { 
+      sourceCol: detectedCols[0] || "", role: "Owner", contactType: "email", 
+      typeVal: "office", personCol: "", personColParts: [], titleVal: "— No Title —" 
+    }]);
   }
+  
+  function updateMulti(i, updates) {
+    const u = [...contactRows];
+    u[i] = { ...u[i], ...updates };
+    setContactRows(u);
+  }
+
   function update(i, field, value) {
-    const u = [...contactRows]; u[i] = { ...u[i], [field]: value }; setContactRows(u);
+    updateMulti(i, { [field]: value });
   }
+
   function remove(i) { setContactRows(contactRows.filter((_, idx) => idx !== i)); }
 
   return (
     <div>
       <p className="text-muted" style={{ fontSize: 13, marginBottom: 16 }}>
-        Map columns containing contact info (emails, phones, names). Each row creates one
-        contact entry per business. Add multiple rows for the same person across different contact types.
+        Map columns containing contact info (emails, phones). Link the person's name and title.
       </p>
 
       {contactRows.length === 0 ? (
         <div style={{
-          textAlign: "center", padding: "28px 20px",
-          border: "1px dashed var(--border2)", borderRadius: 8,
-          color: "var(--text-muted)", marginBottom: 16, fontSize: 13,
+          textAlign: "center", padding: "28px 20px", border: "1px dashed var(--border2)", 
+          borderRadius: 8, color: "var(--text-muted)", marginBottom: 16, fontSize: 13,
         }}>
-          No contact fields mapped. Click <strong>+ Add Row</strong> to begin.
+          Click <strong>+ Add Row</strong> to begin.
         </div>
       ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 1.2fr 28px", gap: 8 }}>
-            {["Value Column", "Contact Type", "Role", "Person Name Column (opt.)", ""].map(h => (
-              <span key={h} style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>{h}</span>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 16 }}>
+          {/* Header */}
+          <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.9fr 0.9fr 0.9fr 1fr 1.5fr 28px", gap: 8 }}>
+            {["Value Column", "Contact", "Type", "Role", "Title", "Name Column(s)", ""].map(h => (
+              <span key={h} style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase" }}>{h}</span>
             ))}
           </div>
+          
           {contactRows.map((row, i) => (
-            <div key={i} style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 1.2fr 28px", gap: 8, alignItems: "center" }}>
-              <select value={row.sourceCol} onChange={e => update(i, "sourceCol", e.target.value)}>
-                {detectedCols.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
-              <select value={row.contactType} onChange={e => update(i, "contactType", e.target.value)}>
-                {CONTACT_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
-              </select>
-              <select value={row.role} onChange={e => update(i, "role", e.target.value)}>
-                {CONTACT_ROLES.map(r => <option key={r} value={r}>{r}</option>)}
-              </select>
-              <select value={row.personCol} onChange={e => update(i, "personCol", e.target.value)}>
-                <option value="">— None —</option>
-                {detectedCols.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
-              <button type="button" onClick={() => remove(i)}
-                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--danger)", fontSize: 18, padding: 0, lineHeight: 1 }}>×</button>
+            <div key={i} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.9fr 0.9fr 0.9fr 1fr 1.5fr 28px", gap: 8, alignItems: "start" }}>
+                
+                <select value={row.sourceCol} onChange={e => update(i, "sourceCol", e.target.value)}>
+                  {detectedCols.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+                
+                <select value={row.contactType} onChange={e => update(i, "contactType", e.target.value)}>
+                  {CONTACT_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+                
+                <select value={row.typeVal || "office"} onChange={e => update(i, "typeVal", e.target.value)}>
+                  {TYPE_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+                
+                <select value={row.role} onChange={e => update(i, "role", e.target.value)}>
+                  {CONTACT_ROLES.map(r => <option key={r} value={r}>{r}</option>)}
+                </select>
+
+                {/* STATIC TITLE DROPDOWN! */}
+                <select value={row.titleVal || "— No Title —"} onChange={e => update(i, "titleVal", e.target.value)}>
+                  {CONTACT_TITLES.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+                
+                {/* Person name — single col or multi-select checkboxes */}
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  <select
+                    value={row.personCol || ""}
+                    onChange={e => {
+                      updateMulti(i, {
+                        personCol: e.target.value,
+                        ...(e.target.value ? { personColParts: [] } : {})
+                      });
+                    }}
+                  >
+                    <option value="">— Single column —</option>
+                    {detectedCols.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  
+                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                    Or check multiple to concatenate:
+                  </div>
+                  
+                  <div style={{ 
+                    maxHeight: 140, overflowY: "auto", border: "1px solid var(--border2)", 
+                    borderRadius: 4, padding: "6px 8px", background: "var(--surface)", 
+                    display: "flex", flexDirection: "column", gap: 8 
+                  }}>
+                    {detectedCols.map(c => {
+                      const isSelected = (row.personColParts || []).includes(c);
+                      return (
+                        <label 
+                          key={c} title={c}
+                          style={{ display: "flex", alignItems: "flex-start", gap: 6, fontSize: 12, cursor: "pointer", margin: 0 }}
+                        >
+                          <input
+                            type="checkbox"
+                            style={{ marginTop: 2 }}
+                            checked={isSelected}
+                            onChange={(e) => {
+                              let currentParts = [...(row.personColParts || [])];
+                              if (e.target.checked) currentParts.push(c);
+                              else currentParts = currentParts.filter(p => p !== c);
+                              
+                              updateMulti(i, {
+                                personColParts: currentParts,
+                                ...(currentParts.length > 0 ? { personCol: "" } : {})
+                              });
+                            }}
+                          />
+                          <span style={{ wordBreak: "break-word", lineHeight: 1.3 }}>{c}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+
+                  {(row.personColParts || []).length > 0 && (
+                    <span style={{ fontSize: 11, color: "var(--accent)", wordBreak: "break-all" }}>
+                      ✓ {row.personColParts.join(" + ")}
+                    </span>
+                  )}
+                </div>
+                
+                <button type="button" onClick={() => remove(i)}
+                  style={{ background: "none", border: "none", cursor: "pointer", color: "var(--danger)", fontSize: 18, padding: 0, marginTop: 4 }}>×</button>
+              </div>
             </div>
           ))}
         </div>
@@ -453,7 +530,10 @@ function CustomTab({ detectedCols, customRows, setCustomRows, businessMap, conta
   const taken = new Set([
     ...Object.entries(businessMap).filter(([,v]) => v !== "SKIP").map(([k]) => k),
     ...contactRows.map(r => r.sourceCol),
+    ...contactRows.map(r => r.personCol).filter(Boolean),
+    ...contactRows.flatMap(r => r.personColParts || []),
   ]);
+  
   const unmapped = detectedCols.filter(c => !taken.has(c) && !customRows.find(r => r.sourceCol === c));
 
   function addRow(col = "") {
@@ -470,15 +550,13 @@ function CustomTab({ detectedCols, customRows, setCustomRows, businessMap, conta
   return (
     <div>
       <p className="text-muted" style={{ fontSize: 13, marginBottom: 16 }}>
-        Any field not in Business or Contact goes here. Set the output label and optionally
-        map it to an existing Bludot custom data field to merge values.
+        Any field not mapped to Business or Contact goes here.
       </p>
 
       {customRows.length === 0 ? (
         <div style={{
-          textAlign: "center", padding: "28px 20px",
-          border: "1px dashed var(--border2)", borderRadius: 8,
-          color: "var(--text-muted)", marginBottom: 16, fontSize: 13,
+          textAlign: "center", padding: "28px 20px", border: "1px dashed var(--border2)", 
+          borderRadius: 8, color: "var(--text-muted)", marginBottom: 16, fontSize: 13,
         }}>
           No custom fields mapped yet.
         </div>
@@ -486,7 +564,7 @@ function CustomTab({ detectedCols, customRows, setCustomRows, businessMap, conta
         <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 28px", gap: 8 }}>
             {["Source Column", "Output Label", "Bludot Custom Field (opt.)", ""].map(h => (
-              <span key={h} style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>{h}</span>
+              <span key={h} style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase" }}>{h}</span>
             ))}
           </div>
           {customRows.map((row, i) => (
@@ -496,9 +574,9 @@ function CustomTab({ detectedCols, customRows, setCustomRows, businessMap, conta
                 {detectedCols.map(c => <option key={c} value={c}>{c}</option>)}
               </select>
               <input value={row.targetLabel} onChange={e => update(i, "targetLabel", e.target.value)} placeholder="Output column name" />
-              <input value={row.bludotCustomCol} onChange={e => update(i, "bludotCustomCol", e.target.value)} placeholder="e.g. Estimated Location Employee Count" />
+              <input value={row.bludotCustomCol} onChange={e => update(i, "bludotCustomCol", e.target.value)} placeholder="e.g. Employee Count" />
               <button type="button" onClick={() => remove(i)}
-                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--danger)", fontSize: 18, padding: 0, lineHeight: 1 }}>×</button>
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--danger)", fontSize: 18, padding: 0 }}>×</button>
             </div>
           ))}
         </div>
@@ -507,9 +585,7 @@ function CustomTab({ detectedCols, customRows, setCustomRows, businessMap, conta
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         <button type="button" className="btn btn-ghost btn-sm" onClick={() => addRow()}>+ Add Custom Field</button>
         {unmapped.length > 0 && (
-          <button type="button" className="btn btn-ghost btn-sm"
-            onClick={() => unmapped.forEach(c => addRow(c))}
-            style={{ color: "var(--text-muted)" }}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => unmapped.forEach(c => addRow(c))} style={{ color: "var(--text-muted)" }}>
             + Add All Unmapped ({unmapped.length})
           </button>
         )}
@@ -521,10 +597,8 @@ function CustomTab({ detectedCols, customRows, setCustomRows, businessMap, conta
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
             {unmapped.map(c => (
               <button key={c} type="button" onClick={() => addRow(c)} style={{
-                padding: "3px 10px", borderRadius: 5, fontSize: 12,
-                fontFamily: "IBM Plex Mono, monospace",
-                background: "var(--surface2)", border: "1px solid var(--border2)",
-                color: "var(--text-muted)", cursor: "pointer",
+                padding: "3px 10px", borderRadius: 5, fontSize: 12, fontFamily: "IBM Plex Mono, monospace",
+                background: "var(--surface2)", border: "1px solid var(--border2)", color: "var(--text-muted)", cursor: "pointer",
               }}>+ {c}</button>
             ))}
           </div>

@@ -203,7 +203,7 @@ def start_pipeline(city_id: int, background_tasks: BackgroundTasks, db: Session 
 
 @app.post("/cities/{city_id}/resume")
 def resume_pipeline(city_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """Resume a paused pipeline after human review is complete."""
+    """Resume a paused pipeline after human review or verification is complete."""
     run = db.query(PipelineRun).filter_by(
         city_id=city_id, status=PipelineStatus.PAUSED
     ).order_by(PipelineRun.id.desc()).first()
@@ -211,12 +211,15 @@ def resume_pipeline(city_id: int, background_tasks: BackgroundTasks, db: Session
     if not run:
         raise HTTPException(400, f"No paused pipeline found for city_id={city_id}")
 
-    # Check all review items are resolved
-    pending = db.query(MatchCandidate).filter_by(
-        city_id=city_id, final_decision=MatchDecision.NEEDS_REVIEW
-    ).count()
-    if pending > 0:
-        raise HTTPException(400, f"There are still {pending} unresolved review items")
+    # Only block resume if the current gate is a MATCH review gate with pending items.
+    # Verification gates (step1, split, step5, contacts) should always resume freely.
+    MATCH_REVIEW_GATES = {"gate2_match_review_pass1", "gate4_match_review_pass2"}
+    if run.current_step in MATCH_REVIEW_GATES:
+        pending = db.query(MatchCandidate).filter_by(
+            city_id=city_id, final_decision=MatchDecision.NEEDS_REVIEW
+        ).count()
+        if pending > 0:
+            raise HTTPException(400, f"There are still {pending} unresolved review items")
 
     background_tasks.add_task(resume_city_pipeline, city_id=city_id)
     return {"message": f"Pipeline resumed for city_id={city_id}"}
