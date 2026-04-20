@@ -16,8 +16,8 @@ from .matching_orchestrator import generate_candidates, run_llm_judge
 logger = logging.getLogger(__name__)
 
 def run_legacy_fuzzy_match(db: Session, city_id: int) -> int:
-    """Mimics the old legacy script by forcefully matching businesses."""
-    logger.info("========== RUNNING LEGACY FUZZY MATCH ==========")
+    """Mimics the old legacy script by forcefully matching businesses using Name, DBA, or Address."""
+    logger.info("========== RUNNING LEGACY FUZZY MATCH (WITH DBA & ADDRESS) ==========")
     candidates = db.query(MatchCandidate).filter(
         MatchCandidate.city_id == city_id,
         MatchCandidate.final_decision == 'PENDING'
@@ -30,15 +30,40 @@ def run_legacy_fuzzy_match(db: Session, city_id: int) -> int:
         if not city_rec or not bludot_rec: 
             continue
 
+        # 1. Extract standard names
         city_name = str(city_rec.business_name).lower().strip()
         bludot_name = str(bludot_rec.name).lower().strip()
 
-        # Calculate Fuzzy Ratio exactly like the old script
-        score = fuzz.ratio(city_name, bludot_name)
-        
-        if score >= 85:  # Legacy threshold
+        # 2. Safely extract DBA Names from raw data (if they exist)
+        city_dba = str(city_rec.raw_data.get('DBA Name', '')).lower().strip() if city_rec.raw_data else ""
+        bludot_dba = str(bludot_rec.raw_data.get('DBA Name', '')).lower().strip() if bludot_rec.raw_data else ""
+
+        # 3. Extract addresses
+        city_address = str(city_rec.address1).lower().strip()
+        bludot_address = str(bludot_rec.address1).lower().strip()
+
+        # 4. Calculate all possible Name & DBA combinations
+        name_score = fuzz.ratio(city_name, bludot_name)
+        city_dba_vs_bludot_name = fuzz.ratio(city_dba, bludot_name) if city_dba else 0
+        city_name_vs_bludot_dba = fuzz.ratio(city_name, bludot_dba) if bludot_dba else 0
+        both_dba_score = fuzz.ratio(city_dba, bludot_dba) if city_dba and bludot_dba else 0
+
+        # Find the absolute best name/DBA match
+        best_name_score = max(name_score, city_dba_vs_bludot_name, city_name_vs_bludot_dba, both_dba_score)
+
+        # 5. Calculate Address match (ignoring if both are blank)
+        address_score = fuzz.ratio(city_address, bludot_address) if city_address and bludot_address else 0
+
+        # 6. DECISION RULE: If ANY name matches >= 85 OR the address matches >= 85
+        if best_name_score >= 85 or (address_score >= 85 and city_address):
             mc.final_decision = MatchDecision.AUTO_MATCH
-            mc.llm_reason = f"Legacy Fuzzy Match (Name Similarity: {score}%)"
+            
+            # Log exactly which rule triggered the match
+            if best_name_score >= 85:
+                mc.llm_reason = f"Legacy Match (Name/DBA Similarity: {best_name_score}%)"
+            else:
+                mc.llm_reason = f"Legacy Match (Address Similarity: {address_score}%)"
+                
             fuzzy_match_count += 1
 
     db.commit()

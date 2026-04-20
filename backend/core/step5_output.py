@@ -129,7 +129,13 @@ def run_step5(city: City, db: Session, results_dir: str) -> dict:
     city_records.fillna("", inplace=True)
 
     final_result = results_path / "output" / "final_result"
-    total_match_records = pd.read_excel(str(final_result / f"final_matched_records_for_{city_name}.xlsx"), dtype=object)
+    # SMART READ: Don't crash if Step 3 found 0 matches and didn't create the file
+    matched_file_path = final_result / f"final_matched_records_for_{city_name}.xlsx"
+    if matched_file_path.exists():
+        total_match_records = pd.read_excel(str(matched_file_path), dtype=object)
+    else:
+        logger.warning(f"Matched records file missing for {city_name}. Assuming 0 matches.")
+        total_match_records = pd.DataFrame() # Create an empty dataframe so the code survives
     additional_city_match_records = pd.read_excel(str(final_result / f"additional_city_records_for_{city_name}.xlsx"), dtype=object)
 
     total_match_records.fillna('', inplace=True)

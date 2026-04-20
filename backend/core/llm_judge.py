@@ -1,6 +1,6 @@
 """
-LLM Judge — Groq (High Accuracy Mode)
-=====================================
+LLM Judge — Groq (High Accuracy Mode with DBA Support)
+======================================================
 Uses Groq's smart model (llama-3.3-70b-versatile).
 Includes proactive pacing to safely stay under the 6,000 TPM free-tier limit.
 """
@@ -73,7 +73,6 @@ def _call_llm(prompt: str, max_tokens: int = 1024, retries: int = None) -> dict 
         try:
             client = _get_client()
 
-            # SMARTEST MODEL: llama-3.3-70b-versatile
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
@@ -123,18 +122,20 @@ def _call_llm(prompt: str, max_tokens: int = 1024, retries: int = None) -> dict 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
+# UPDATED: Added aggressive DBA rules to force matches
 BATCH_MATCH_PROMPT = """You are an expert at matching business records from two data sources.
 
 For each numbered pair below, decide if Record A and Record B refer to the SAME physical business.
 
 RULES (apply to every pair):
-1. Both street numbers present AND different → NOT same business.
-2. One name clearly contained in the other → likely SAME business.
-3. One/both addresses blank → judge by name only.
-4. Missing street number in one → do not penalise.
-5. Ignore legal suffixes (LLC, Inc, Corp, Ltd).
-6. Ignore spelling/abbreviation differences (St/Street, Ave/Avenue).
-7. DBA names vs legal names are acceptable variations.
+1. CRITICAL: If Record A's Primary Name matches Record B's DBA Name (or vice versa), you MUST output MATCH.
+2. CRITICAL: If Record A's DBA Name matches Record B's DBA Name, you MUST output MATCH.
+3. Both street numbers present AND different → NOT same business.
+4. One name clearly contained in the other → likely SAME business.
+5. One/both addresses blank → judge by name and DBA only.
+6. Missing street number in one → do not penalise.
+7. Ignore legal suffixes (LLC, Inc, Corp, Ltd).
+8. Ignore spelling/abbreviation differences (St/Street, Ave/Avenue).
 
 PAIRS:
 {pairs_block}
@@ -197,6 +198,7 @@ Every source column must appear exactly once."""
 
 # ── Match judging ─────────────────────────────────────────────────────────────
 
+# UPDATED: Added city_dba and bludot_dba explicitly
 @dataclass
 class CandidatePair:
     candidate_id: int
@@ -205,6 +207,8 @@ class CandidatePair:
     bludot_name: str
     bludot_address: str
     rule_reason: str
+    city_dba: str = field(default="")
+    bludot_dba: str = field(default="")
 
 
 def judge_candidates(pairs: list[CandidatePair]) -> list[dict]:
@@ -215,7 +219,6 @@ def judge_candidates(pairs: list[CandidatePair]) -> list[dict]:
     if not has_api_key():
         return [{"candidate_id": p.candidate_id, "llm_decision": "UNCERTAIN", "llm_reason": "No API key", "llm_called_at": now} for p in pairs]
 
-    # PACED CHUNKING: Tiny chunks to survive the 6000 TPM limit
     CHUNK_SIZE = 20
     all_outputs = []
 
@@ -224,13 +227,19 @@ def judge_candidates(pairs: list[CandidatePair]) -> list[dict]:
         
         lines = []
         for i, p in enumerate(chunk, 1):
-            # SAFE TRUNCATION: 250 chars gives it plenty of context to make a smart decision
-            c_name = str(p.city_name or '(blank)')[:250].replace("\n", " ")
+            c_name = str(p.city_name or '(blank)')[:150].replace("\n", " ")
+            c_dba = str(p.city_dba or '')[:100].replace("\n", " ")
             c_addr = str(p.city_address or '(blank)')[:250].replace("\n", " ")
-            b_name = str(p.bludot_name or '(blank)')[:250].replace("\n", " ")
+            
+            b_name = str(p.bludot_name or '(blank)')[:150].replace("\n", " ")
+            b_dba = str(p.bludot_dba or '')[:100].replace("\n", " ")
             b_addr = str(p.bludot_address or '(blank)')[:250].replace("\n", " ")
 
-            lines.append(f"{i}. A: \"{c_name}\" / \"{c_addr}\"\n   B: \"{b_name}\" / \"{b_addr}\"")
+            # UPDATED: Inject DBA directly into the text the AI reads
+            c_display = f"{c_name}" + (f" (DBA: {c_dba})" if c_dba else "")
+            b_display = f"{b_name}" + (f" (DBA: {b_dba})" if b_dba else "")
+
+            lines.append(f"{i}. A: \"{c_display}\" / \"{c_addr}\"\n   B: \"{b_display}\" / \"{b_addr}\"")
 
         max_out = min(200 + len(chunk) * 40, 4096)
         prompt = BATCH_MATCH_PROMPT.format(pairs_block="\n".join(lines))
@@ -256,15 +265,23 @@ def judge_candidates(pairs: list[CandidatePair]) -> list[dict]:
                 "llm_called_at": now,
             })
             
-        # PROACTIVE PACING: Wait 12 seconds between chunks to avoid TPM bans
         if chunk_idx + CHUNK_SIZE < len(pairs):
             time.sleep(12)
             
     return all_outputs
 
 
-def judge_single_pair(candidate_id, city_name, city_address, bludot_name, bludot_address) -> dict:
-    pair = CandidatePair(candidate_id=candidate_id, city_name=city_name, city_address=city_address, bludot_name=bludot_name, bludot_address=bludot_address, rule_reason="")
+def judge_single_pair(candidate_id, city_name, city_address, bludot_name, bludot_address, city_dba="", bludot_dba="") -> dict:
+    pair = CandidatePair(
+        candidate_id=candidate_id, 
+        city_name=city_name, 
+        city_address=city_address, 
+        bludot_name=bludot_name, 
+        bludot_address=bludot_address, 
+        rule_reason="",
+        city_dba=city_dba,
+        bludot_dba=bludot_dba
+    )
     results = judge_candidates([pair])
     return results[0] if results else {}
 
@@ -331,7 +348,6 @@ def judge_dedup_pairs(pairs: list[DedupPair]) -> list[dict]:
                 "reason"  : r.get("reason", ""),
             })
 
-        # PROACTIVE PACING
         if chunk_idx + CHUNK_SIZE < len(pairs):
             time.sleep(12)
 

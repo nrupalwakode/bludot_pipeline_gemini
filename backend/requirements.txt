@@ -2,8 +2,10 @@
 fastapi==0.111.0
 uvicorn[standard]==0.28.1
 python-multipart==0.0.9
+
 # Database
 sqlalchemy==2.0.30
+
 # Matching engine
 rapidfuzz==3.9.1
 scikit-learn==1.5.0
@@ -12,10 +14,19 @@ numpy==1.26.4
 pandas==2.2.2
 openpyxl==3.1.4
 tqdm==4.66.4
+datasketch==1.5.4
+
 # LLM
 groq>=0.11.0
+
 # Address parsing
 usaddress==0.5.10
+
 # Utils
 python-dotenv==1.0.1
 pydantic==2.7.1
+
+# ── AI Model Dependencies (CPU ONLY) ──
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+sentence-transformers==2.7.0
